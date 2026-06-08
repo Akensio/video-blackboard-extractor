@@ -1,0 +1,52 @@
+[project]
+name = "video-blackboard-extractor"
+version = "0.1.0"
+description = "Extract clean blackboard keyframes and timestamped transcripts from static-camera lecture videos."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "akensio" }]
+
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "opencv-python>=4.9",
+    "numpy>=1.26,<2.3",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "imagehash>=4.3",
+    "Pillow>=10.0",
+    "imageio-ffmpeg>=0.5",
+    "typer>=0.12",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# CUDA runtime libs faster-whisper needs for GPU mode. The CPU fallback works
+# without these, so the extra is opt-in.
+gpu = [
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12>=9,<10",
+]
+# Better lecturer removal via person segmentation (optional).
+seg = [
+    "ultralytics>=8.2",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+vbe = "vbe.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vbe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

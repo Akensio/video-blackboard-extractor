@@ -1,0 +1,39 @@
+# ==========================================================================
+# NEVER-BREAK RULE: the lecture videos live in gitignore/ and must NEVER be
+# committed. Derived artifacts (board images, transcripts) go to output/ and
+# are likewise never committed. Do not remove these two lines.
+# ==========================================================================
+/gitignore/
+/output/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.uv/
+uv.lock.bak
+
+# Downloaded model weights (YOLO etc.) - fetched on demand, never committed
+*.pt
+*.onnx
+
+# Caches / scratch
+.vbe_cache/
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

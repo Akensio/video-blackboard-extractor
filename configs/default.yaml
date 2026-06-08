@@ -1,0 +1,75 @@
+# Default configuration for video-blackboard-extractor.
+# Per-video configs (e.g. configs/lecture01.yaml) can override any of these keys
+# and additionally supply `rois` (the board panel polygons for that video).
+
+# ---------------------------------------------------------------------------
+# Frame decoding / analysis
+# ---------------------------------------------------------------------------
+analysis_fps: 1.0          # frames/sec sampled for CV analysis (board changes slowly)
+analysis_width: 960        # downscale width for analysis; export uses full res
+export_format: png         # png (lossless, recommended) or jpg
+
+# ---------------------------------------------------------------------------
+# Lecturer removal / background reconstruction
+# ---------------------------------------------------------------------------
+person_removal: median      # median | gated_median | none
+median_window_seconds: 90   # temporal window (+/-) for the per-pixel median plate
+seg_model: yolov8n-seg.pt   # used only when person_removal == gated_median ([seg] extra)
+person_dilate_px: 9         # dilate person masks to catch arms/chalk-dust edges
+
+# ---------------------------------------------------------------------------
+# Chalk fullness signal
+# ---------------------------------------------------------------------------
+chalk_tophat_kernel: 15     # morphological top-hat kernel (px) to isolate thin strokes
+chalk_threshold: 18         # brightness above local board baseline to count as chalk
+fullness_smooth_window: 9   # Savitzky-Golay window (odd, in analysis frames)
+
+# ---------------------------------------------------------------------------
+# Epoch segmentation (erase / slide detection)
+# ---------------------------------------------------------------------------
+erase_min_drop: 0.18        # min relative fullness drop to count as an erase event
+erase_refractory_seconds: 20  # min spacing between detected events
+slide_shift_px: 25          # vertical phase-correlation shift (px) => slide, not erase
+min_epoch_seconds: 25       # ignore epochs shorter than this
+
+# ---------------------------------------------------------------------------
+# Keyframe scoring (best frame within the pre-event window)
+# ---------------------------------------------------------------------------
+keyframe_presnap_seconds: 8   # look this many seconds before the event for the best frame
+weight_fullness: 1.0
+weight_occlusion: 1.5         # penalty for lecturer covering the ROI
+weight_sharpness: 0.4         # reward sharp (non-motion-blurred) frames
+emit_region_crops: true       # also export per-panel crops, not just full-wall frames
+
+# ---------------------------------------------------------------------------
+# Near-duplicate suppression
+# ---------------------------------------------------------------------------
+phash_max_distance: 8         # Hamming distance below which frames are near-duplicates
+ssim_tiebreak: 0.92           # SSIM above which a borderline pair is a duplicate
+
+# ---------------------------------------------------------------------------
+# Transcription (faster-whisper)
+# ---------------------------------------------------------------------------
+asr_model: large-v3
+asr_device: auto              # auto | cuda | cpu  (auto tries CUDA, falls back to CPU)
+asr_compute_type_gpu: int8_float16
+asr_compute_type_cpu: int8
+asr_beam_size_gpu: 2
+asr_beam_size_cpu: 5
+asr_language: en
+asr_vad: true
+asr_word_timestamps: true
+asr_condition_on_previous_text: true   # flip to false if you see repetition loops
+# Compact physics glossary biasing Whisper spelling (only last ~224 tokens are used;
+# rarest / highest-value terms go last).
+asr_initial_prompt: >-
+  This is a graduate quantum field theory lecture. Terms used include
+  Lagrangian, Hamiltonian, path integral, propagator, Green's function,
+  perturbation theory, Feynman diagram, vertex, loop integral, self-energy,
+  counterterm, regularization, dimensional regularization, gauge field,
+  Ward identity, beta function, renormalization group, renormalization.
+
+# ---------------------------------------------------------------------------
+# Pairing keyframes <-> transcript
+# ---------------------------------------------------------------------------
+pair_margin_seconds: 15       # widen each keyframe's epoch window by this when pulling text
