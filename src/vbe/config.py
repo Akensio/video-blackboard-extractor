@@ -46,11 +46,26 @@ class Config(BaseModel):
     # --- chalk fullness signal ---
     chalk_tophat_kernel: int = 15
     chalk_threshold: int = 18
-    fullness_smooth_window: int = 9
+    fullness_smooth_window: int = 15
+    min_visible_fraction: float = 0.35  # below this, the column is too occluded to read
 
-    # --- epoch segmentation ---
-    erase_min_drop: float = 0.18
+    # --- writing-burst timeline ---
+    burst_rate_threshold: float = 0.00025  # fullness/sec counted as active writing
+    burst_merge_gap_seconds: float = 60.0  # talking pauses shorter than this stay in-burst
+    burst_min_gain: float = 0.012          # min fullness a burst must add to emit a snapshot
+    burst_post_window_seconds: float = 30.0  # search window after a burst for the cleanest capture
+    burst_deriv_window_seconds: float = 31.0  # smoothing window for the writing-rate derivative
+
+    # --- full-res export ---
+    export_window_seconds: float = 60.0  # backward median window for clean-frame export
+    export_fps: float = 0.5              # decode fps inside that window
+    enhance_crops: bool = True           # also emit CLAHE-enhanced grayscale crops
+
+    # --- erase detection ---
+    erase_min_drop: float = 0.35           # RELATIVE drop from the running peak
     erase_refractory_seconds: float = 20.0
+    erase_min_peak: float = 0.03           # boards emptier than this never "erase"
+    erase_persist_seconds: float = 10.0    # the drop must hold this long
     slide_shift_px: float = 25.0
     min_epoch_seconds: float = 25.0
 

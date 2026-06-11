@@ -1,15 +1,18 @@
-"""Pair keyframes with the transcript.
+"""Pair timeline snapshots with the transcript.
 
-Each keyframe is captured just before its board is erased, so the speech that
-explains it runs from the *previous* keyframe up to (and slightly past) this one.
-We attach that text window to each keyframe - the direct basis for notes.
+The lecturer talks about a board while writing it and just after, and he often
+interleaves writing on several boards, so windows are allowed to OVERLAP: each
+snapshot gets the speech from the start of its own writing burst until either
+its capture (+margin) or the start of the next snapshot's burst - whichever is
+later. Concurrently-written boards therefore share the text spoken while both
+were in progress; that redundancy is deliberate and harmless for notes.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from .manifest import read_manifest, write_manifest
+from .manifest import read_timeline, write_timeline
 
 
 def _load_segments(transcript_json: str | Path) -> list[dict]:
@@ -25,26 +28,39 @@ def _text_in_window(segments: list[dict], t0: float, t1: float) -> tuple[str, fl
     return text, picked[0]["start"], picked[-1]["end"]
 
 
-def pair_manifest(
-    manifest_path: str | Path,
+def pair_timeline(
+    timeline_path: str | Path,
     transcript_json: str | Path,
     margin_seconds: float = 15.0,
+    last_window_seconds: float = 300.0,
 ) -> Path:
-    manifest = read_manifest(manifest_path)
+    timeline = read_timeline(timeline_path)
     segments = _load_segments(transcript_json)
-    keyframes = manifest.get("keyframes", [])
+    snaps = sorted(timeline.get("snapshots", []),
+                   key=lambda s: s["writing_interval"][0])
 
-    prev_t = 0.0
-    for kf in keyframes:
-        t = float(kf["time"])
-        t0 = max(0.0, prev_t)
-        t1 = t + margin_seconds
+    for i, snap in enumerate(snaps):
+        t0 = max(0.0, snap["writing_interval"][0] - margin_seconds)
+        own_span = snap["capture_time"] + margin_seconds
+        if i + 1 < len(snaps):
+            t1 = max(own_span, snaps[i + 1]["writing_interval"][0])
+        else:
+            # Last snapshot: bounded window (not the entire remaining lecture),
+            # capped at the erase if one follows.
+            t1 = snap["capture_time"] + last_window_seconds
+            if snap.get("erased_at"):
+                t1 = min(t1, snap["erased_at"] + margin_seconds)
         text, ts0, ts1 = _text_in_window(segments, t0, t1)
-        kf["transcript_text"] = text
-        kf["transcript_start"] = ts0
-        kf["transcript_end"] = ts1
-        prev_t = t
+        snap["transcript"] = {"start": ts0, "end": ts1, "text": text}
 
-    out_dir = Path(manifest_path).parent
-    return write_manifest(out_dir, manifest.get("video", ""), keyframes,
-                          montage=manifest.get("montage"))
+    # Speech before the first writing burst (course intro, recap, etc.).
+    if snaps:
+        first_start = snaps[0]["writing_interval"][0]
+        pre_text, p0, p1 = _text_in_window(segments, 0.0, first_start)
+        if pre_text:
+            timeline["preamble_transcript"] = {"start": p0, "end": p1, "text": pre_text}
+
+    timeline["snapshots"] = sorted(snaps, key=lambda s: s["capture_time"])
+    timeline["transcript_file"] = Path(transcript_json).name
+    out_dir = Path(timeline_path).parent
+    return write_timeline(out_dir, timeline)

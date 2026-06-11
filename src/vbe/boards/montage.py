@@ -1,4 +1,4 @@
-"""Contact-sheet montage of keyframe thumbnails with timestamp captions."""
+"""Contact-sheet montage of snapshot thumbnails with caption strings."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,16 +6,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 
-def _fmt_t(seconds: float) -> str:
-    s = int(round(seconds))
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
 def make_montage(
     image_paths: list[Path],
-    times: list[float],
+    captions: list[str],
     out_path: str | Path,
     cols: int = 3,
     thumb_w: int = 480,
@@ -40,11 +33,11 @@ def make_montage(
 
     sheet = Image.new("RGB", (sheet_w, sheet_h), (20, 20, 20))
     draw = ImageDraw.Draw(sheet)
-    for i, (thumb, t) in enumerate(zip(thumbs, times)):
+    for i, (thumb, cap) in enumerate(zip(thumbs, captions)):
         r, c = divmod(i, cols)
         x = pad + c * (cell_w + pad)
         y = pad + r * (cell_h + pad)
-        draw.text((x + 2, y + 2), f"#{i + 1}  t={_fmt_t(t)}", fill=(240, 240, 240))
+        draw.text((x + 2, y + 2), cap, fill=(240, 240, 240))
         sheet.paste(thumb, (x, y + caption_h))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

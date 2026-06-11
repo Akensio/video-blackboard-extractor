@@ -114,6 +114,14 @@ def decode_frames(
     """
     import numpy as np
 
+    # Fail loudly on falsy-but-not-None values (False/0 would silently decode
+    # nothing via `-t 0.000`).
+    if duration is not None and not (isinstance(duration, (int, float))
+                                     and not isinstance(duration, bool) and duration > 0):
+        raise ValueError(f"duration must be a positive number or None, got {duration!r}")
+    if start is not None and isinstance(start, bool):
+        raise ValueError(f"start must be a number or None, got {start!r}")
+
     vf = [f"fps={fps}"]
     if size is not None:
         vf.append(f"scale={size[0]}:{size[1]}")

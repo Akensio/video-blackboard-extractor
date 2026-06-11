@@ -1,37 +1,59 @@
 import json
 
-from vbe.pairing import pair_manifest
+from vbe.pairing import pair_timeline
 
 
 def _write(path, obj):
     path.write_text(json.dumps(obj), encoding="utf-8")
 
 
-def test_pair_attaches_text_window(tmp_path):
+def test_pair_attaches_burst_window_text(tmp_path):
     transcript = tmp_path / "transcript.json"
-    manifest = tmp_path / "manifest.json"
+    timeline = tmp_path / "timeline.json"
     _write(transcript, {
         "segments": [
             {"start": 0, "end": 5, "text": "intro"},
-            {"start": 10, "end": 20, "text": "about board one"},
-            {"start": 30, "end": 40, "text": "about board two"},
+            {"start": 100, "end": 130, "text": "writing board one"},
+            {"start": 200, "end": 240, "text": "explaining board one"},
+            {"start": 400, "end": 450, "text": "writing board two"},
         ]
     })
-    _write(manifest, {
+    _write(timeline, {
         "video": "v.mp4",
-        "keyframes": [
-            {"id": 1, "time": 22, "image": "a.png"},
-            {"id": 2, "time": 42, "image": "b.png"},
+        "snapshots": [
+            {"id": 1, "column": "left", "writing_interval": [95, 180],
+             "capture_time": 190},
+            {"id": 2, "column": "center", "writing_interval": [395, 460],
+             "capture_time": 470},
         ],
     })
 
-    pair_manifest(manifest, transcript, margin_seconds=2)
-    out = json.loads(manifest.read_text(encoding="utf-8"))
-    kf1, kf2 = out["keyframes"]
+    pair_timeline(timeline, transcript, margin_seconds=10)
+    out = json.loads(timeline.read_text(encoding="utf-8"))
+    s1, s2 = out["snapshots"]
 
-    # kf1 window [0, 24] picks up intro + board one, not board two.
-    assert "board one" in kf1["transcript_text"]
-    assert "board two" not in kf1["transcript_text"]
-    # kf2 window [22, 44] picks up board two.
-    assert "board two" in kf2["transcript_text"]
-    assert kf2["transcript_start"] == 30
+    # snapshot 1 window [85, 405): the writing AND the explanation that follows,
+    # but not board two's writing text... margin makes the boundary 405 so the
+    # segment starting at 400 IS included at the edge - that overlap is by design.
+    assert "writing board one" in s1["transcript"]["text"]
+    assert "explaining board one" in s1["transcript"]["text"]
+    assert "intro" not in s1["transcript"]["text"]
+    # snapshot 2 (last) takes everything from its burst start onward
+    assert "writing board two" in s2["transcript"]["text"]
+    assert "explaining board one" not in s2["transcript"]["text"]
+    assert out["transcript_file"] == "transcript.json"
+
+
+def test_pair_empty_window_gives_empty_text(tmp_path):
+    transcript = tmp_path / "transcript.json"
+    timeline = tmp_path / "timeline.json"
+    _write(transcript, {"segments": [{"start": 0, "end": 5, "text": "intro"}]})
+    _write(timeline, {
+        "video": "v.mp4",
+        "snapshots": [{"id": 1, "column": "left",
+                       "writing_interval": [500, 600], "capture_time": 610}],
+    })
+    pair_timeline(timeline, transcript, margin_seconds=5)
+    out = json.loads(timeline.read_text(encoding="utf-8"))
+    assert out["snapshots"][0]["transcript"]["text"] == ""
+    assert out["snapshots"][0]["transcript"]["start"] is None

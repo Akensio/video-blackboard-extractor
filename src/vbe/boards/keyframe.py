@@ -88,6 +88,11 @@ def build_clean_frame(
         # source itself is person-free even where he lingered.
         masks = np.stack([segmenter.mask(f, dilate_px=dilate_px) for f in sample], axis=0)
         plate = background.masked_median_plate(stack, np.repeat(masks[..., None], 3, axis=3))
+        # Pixels he covered in EVERY window frame have no person-free local
+        # sample; the whole-lecture plate is the best available source there.
+        holes = masks.all(axis=0)
+        if global_plate is not None and holes.any():
+            plate[holes] = global_plate[holes]
         pmask = segmenter.mask(raw, dilate_px=dilate_px)
     else:
         plate = background.median_plate(stack)
@@ -103,9 +108,11 @@ def build_clean_frame(
     out = raw.copy()
     out[pmask] = plate[pmask]
 
-    # Fill any pixels where the local plate still contains the lecturer (he
-    # lingered the whole window) from the person-free global plate.
-    if global_plate is not None:
+    # Plain-median path only: fill pixels where the local plate still contains
+    # the lecturer (he lingered the whole window) from the person-free global
+    # plate. With a segmenter the masked median is already person-free, and the
+    # whole-lecture median could paste chalk from a different era of the board.
+    if global_plate is not None and segmenter is None:
         gloc = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
         gglob = cv2.cvtColor(global_plate, cv2.COLOR_BGR2GRAY)
         residual = pmask & (cv2.absdiff(gloc, gglob) > fg_thr)

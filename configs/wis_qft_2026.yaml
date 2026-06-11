@@ -1,0 +1,19 @@
+# Shared config for ALL FOUR 2026 QFT lectures (same hall, same fixed camera).
+# Pass this file via --config for any of the videos in gitignore/.
+#
+# The board wall is three COLUMNS separated by wooden pillars; within each
+# column two boards slide vertically on rails. Column ROIs cover the full
+# sliding range, so slides keep content inside the same ROI (only a true
+# erase drops the column's chalk fullness).
+#
+# Coordinates are FULL-RESOLUTION (1920x1080), measured on plate_fullres.png
+# brightness profiles and verified visually on busy frames (roi_check_*.png).
+person_removal: gated_median
+
+rois:
+  - name: left
+    polygon: [[28, 250], [575, 250], [575, 825], [28, 825]]
+  - name: center
+    polygon: [[668, 222], [1250, 222], [1250, 825], [668, 825]]
+  - name: right
+    polygon: [[1345, 250], [1910, 250], [1910, 825], [1345, 825]]

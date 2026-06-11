@@ -25,8 +25,19 @@ def detect_events(
     fullness: np.ndarray,
     min_drop: float,
     refractory_frames: int,
+    min_peak: float = 0.03,
+    persist_frames: int = 8,
 ) -> list[Event]:
-    """Find significant drops from a running peak (a state machine over the signal)."""
+    """Find erase events: RELATIVE drops from a running peak that persist.
+
+    `min_drop` is a fraction of the running peak (a wipe removes most of a
+    board, so ~0.35+ of its chalk disappears), not an absolute fullness value -
+    full boards only reach ~0.15-0.2 absolute fullness, so absolute thresholds
+    near that scale can never fire. To avoid firing on transient dips (residual
+    occlusion noise), the signal must stay below the drop level for
+    `persist_frames` consecutive samples, and near-empty boards
+    (peak < `min_peak`) never produce events.
+    """
     events: list[Event] = []
     n = len(fullness)
     if n == 0:
@@ -36,17 +47,32 @@ def detect_events(
     peak_idx = 0
     last_event = -(10**9)
 
-    for i in range(1, n):
+    i = 1
+    while i < n:
         v = float(fullness[i])
         if v >= peak_val:
             peak_val = v
             peak_idx = i
+            i += 1
             continue
-        if peak_val - v >= min_drop and (i - last_event) >= refractory_frames:
-            events.append(Event(drop_index=i, peak_index=peak_idx, drop=peak_val - v))
-            last_event = i
-            peak_val = v
-            peak_idx = i
+        dropped = (peak_val >= min_peak
+                   and (peak_val - v) >= min_drop * peak_val
+                   and (i - last_event) >= refractory_frames)
+        if dropped:
+            # require persistence: the drop must hold for persist_frames samples
+            hold = fullness[i:i + persist_frames]
+            threshold = peak_val - min_drop * peak_val
+            if len(hold) >= max(1, persist_frames // 2) and np.all(hold <= threshold):
+                events.append(Event(drop_index=i, peak_index=peak_idx,
+                                    drop=peak_val - v))
+                last_event = i
+                # reset the running peak to the post-drop level
+                j = min(i + persist_frames, n - 1)
+                peak_val = float(fullness[j])
+                peak_idx = j
+                i = j + 1
+                continue
+        i += 1
     return events
 
 

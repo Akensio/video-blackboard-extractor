@@ -22,13 +22,32 @@ person_dilate_px: 9         # dilate person masks to catch arms/chalk-dust edges
 # ---------------------------------------------------------------------------
 chalk_tophat_kernel: 15     # morphological top-hat kernel (px) to isolate thin strokes
 chalk_threshold: 18         # brightness above local board baseline to count as chalk
-fullness_smooth_window: 9   # Savitzky-Golay window (odd, in analysis frames)
+fullness_smooth_window: 15  # Savitzky-Golay window (odd, in analysis frames)
+min_visible_fraction: 0.35  # below this visible fraction the fullness sample is interpolated
 
 # ---------------------------------------------------------------------------
-# Epoch segmentation (erase / slide detection)
+# Writing-burst timeline (the per-board write/talk/erase segmentation)
 # ---------------------------------------------------------------------------
-erase_min_drop: 0.18        # min relative fullness drop to count as an erase event
+burst_rate_threshold: 0.00025    # fullness/sec that counts as active writing
+burst_merge_gap_seconds: 60      # talking pauses shorter than this stay inside one burst
+burst_min_gain: 0.012            # min fullness a burst must add to emit a snapshot
+burst_post_window_seconds: 30    # search window after a burst for the cleanest capture
+burst_deriv_window_seconds: 31   # smoothing window for the writing-rate derivative
+
+# ---------------------------------------------------------------------------
+# Full-resolution export
+# ---------------------------------------------------------------------------
+export_window_seconds: 60        # backward median window for clean-frame export
+export_fps: 0.5                  # decode fps inside that window
+enhance_crops: true              # also emit CLAHE-enhanced grayscale crops
+
+# ---------------------------------------------------------------------------
+# Erase detection
+# ---------------------------------------------------------------------------
+erase_min_drop: 0.35        # RELATIVE fullness drop from the running peak (wipes remove most chalk)
 erase_refractory_seconds: 20  # min spacing between detected events
+erase_min_peak: 0.03        # boards emptier than this never produce erase events
+erase_persist_seconds: 10   # the drop must hold this long (rejects occlusion transients)
 slide_shift_px: 25          # vertical phase-correlation shift (px) => slide, not erase
 min_epoch_seconds: 25       # ignore epochs shorter than this
 

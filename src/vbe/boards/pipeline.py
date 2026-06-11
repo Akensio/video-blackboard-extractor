@@ -1,11 +1,17 @@
-"""Blackboard keyframe extraction orchestrator.
+"""Board-timeline extraction orchestrator.
 
-End to end: decode -> analysis-resolution fullness/occlusion/sharpness signals ->
-per-panel erase/slide epoch detection -> pick the fullest, least-occluded moments
--> export full-resolution lecturer-removed keyframes + crops + montage + records.
+Per column of boards (the camera wall has three), this builds the lecture's
+writing timeline:
+
+  decode low-fps frames -> occlusion-aware chalk-fullness per column
+  -> erase events (board lifecycle) and writing bursts (write/talk/write)
+  -> one snapshot per burst, captured at the cleanest post-burst moment
+  -> full-res lecturer-removed export: column crop (+ enhanced) + wall context
+  -> timeline.json: chronological snapshots with writing intervals.
 """
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,7 +22,7 @@ from tqdm import tqdm
 from ..config import Config
 from ..io import ffmpeg
 from ..io.frame_cache import FrameCache
-from . import background, dedup, epochs, fullness, keyframe, montage, person, roi
+from . import background, bursts, enhance, epochs, fullness, keyframe, montage, person, roi
 
 
 def _fmt_t(seconds: float) -> str:
@@ -26,37 +32,177 @@ def _fmt_t(seconds: float) -> str:
     return f"{h:02d}-{m:02d}-{s:02d}"
 
 
+def _clock(seconds: float) -> str:
+    return _fmt_t(seconds).replace("-", ":")
+
+
 @dataclass
-class BoardsResult:
+class TimelineResult:
     video: str
-    keyframes: list[dict] = field(default_factory=list)
+    duration: float
+    columns: list[str] = field(default_factory=list)
+    snapshots: list[dict] = field(default_factory=list)
     montage: str | None = None
+    analysis_start: float = 0.0
+    analysis_end: float = 0.0
 
 
-def _global_color_plate(video_path, times: np.ndarray, k: int = 41) -> np.ndarray:
-    """Full-resolution, person-free color plate: median over frames sampled across
-    the whole analysis range in a single low-fps ffmpeg pass."""
+@dataclass
+class _Snapshot:
+    column: str
+    board_index: int          # 1-based, increments at each erase in the column
+    burst: bursts.Burst
+    capture_index: int
+    capture_time: float
+    fullness: float
+    occlusion: float
+    erased_at: float | None = None
+    final: bool = False
+
+
+def _signals(cache: FrameCache, cfg: Config, columns, masks, bboxes, grid):
+    """Single pass over cached frames -> per-column occlusion-aware signals.
+
+    Fullness uses a per-pixel CHALK-HOLD estimator: each pixel keeps its last
+    chalk reading from a frame where it was visible, so the measured fullness
+    is always over the column's full area. Dividing by only the visible area
+    would bias the estimate up or down depending on whether the lecturer covers
+    a blank or a written part of the board, creating phantom writing bursts.
+    """
+    n = cache.n
+    names = [c.name for c in columns]
+    raw = {nm: np.zeros(n) for nm in names}
+    occ = {nm: np.zeros(n) for nm in names}
+    sharp = {nm: np.zeros(n) for nm in names}
+
+    areas = {nm: int(masks[nm].sum()) for nm in names}
+    chalk_hold = np.zeros((cache.height, cache.width), dtype=bool)
+    for i in tqdm(range(n), desc="analysing frames", unit="f"):
+        gray = cache.get(i)
+        chalk = fullness.chalk_mask(gray, cfg.chalk_tophat_kernel, cfg.chalk_threshold)
+        pmask = person.person_foreground(gray, grid.nearest(i), dilate_px=cfg.person_dilate_px)
+        visible = ~pmask
+        chalk_hold[visible] = chalk[visible]
+        lap = None
+        for nm in names:
+            m = masks[nm]
+            area = areas[nm]
+            if area == 0:
+                continue
+            occ[nm][i] = 1.0 - int((m & visible).sum()) / area
+            raw[nm][i] = np.count_nonzero(chalk_hold & m) / area
+            # Sharpness over visible board pixels only - the lecturer's edges
+            # otherwise dominate the Laplacian and reward occluded frames.
+            x0, y0, x1, y1 = bboxes[nm]
+            if lap is None:
+                lap = cv2.Laplacian(gray, cv2.CV_64F)
+            region_vis = visible[y0:y1, x0:x1]
+            vals = lap[y0:y1, x0:x1][region_vis]
+            sharp[nm][i] = float(vals.var()) if vals.size > 100 else 0.0
+
+    smooth = {nm: fullness.smooth_signal(raw[nm], cfg.fullness_smooth_window) for nm in names}
+    return smooth, occ, sharp
+
+
+def _column_snapshots(nm, f, occ_sig, sharp_sig, cache, cfg, fps) -> list[_Snapshot]:
+    """Erase events + writing bursts -> capture-scored snapshots for one column."""
+    refractory = max(1, round(cfg.erase_refractory_seconds * fps))
+    persist = max(1, round(cfg.erase_persist_seconds * fps))
+    events = epochs.detect_events(
+        f, cfg.erase_min_drop, refractory,
+        min_peak=cfg.erase_min_peak, persist_frames=persist,
+    )
+    erase_idx = [e.drop_index for e in events]
+
+    blist = bursts.detect_bursts(
+        f, fps,
+        rate_threshold=cfg.burst_rate_threshold,
+        merge_gap_seconds=cfg.burst_merge_gap_seconds,
+        min_gain=cfg.burst_min_gain,
+        erase_indices=erase_idx,
+        deriv_window_seconds=cfg.burst_deriv_window_seconds,
+    )
+
+    scores = keyframe.score_frames(
+        f, occ_sig, sharp_sig,
+        cfg.weight_fullness, cfg.weight_occlusion, cfg.weight_sharpness,
+    )
+    post = max(1, round(cfg.burst_post_window_seconds * fps))
+
+    snaps: list[_Snapshot] = []
+    for b in blist:
+        hi = b.end + post + 1
+        nxt_event = next((e for e in events if e.drop_index > b.end), None)
+        if nxt_event is not None:
+            # Cap at the pre-erase PEAK: frames between the peak and the
+            # detected drop are already mid-wipe.
+            hi = min(hi, max(nxt_event.peak_index + 1, b.end + 1))
+        ci = keyframe.select_best_index(scores, b.end, max(hi, b.end + 1))
+        board_index = 1 + sum(1 for e in erase_idx if e <= b.start)
+        erased_at = (float(cache.times[nxt_event.drop_index])
+                     if nxt_event is not None else None)
+        snaps.append(_Snapshot(
+            column=nm, board_index=board_index, burst=b,
+            capture_index=ci, capture_time=float(cache.times[ci]),
+            fullness=float(f[ci]), occlusion=float(occ_sig[ci]),
+            erased_at=erased_at,
+        ))
+
+    # final = last snapshot of each board (next column event is an erase or video end)
+    for i, s in enumerate(snaps):
+        later_same_board = any(
+            t.board_index == s.board_index for t in snaps[i + 1:]
+        )
+        s.final = not later_same_board
+    return snaps
+
+
+def _merge_near_duplicates(snaps: list[_Snapshot], cache: FrameCache, bboxes,
+                           phash_max: int) -> list[_Snapshot]:
+    """Within a column, merge consecutive snapshots whose board content is
+    near-identical (a burst that added almost nothing visible). The later
+    snapshot wins; its writing interval is extended back to the earlier start."""
+    import imagehash
+    from PIL import Image
+
+    def crop_hash(s: _Snapshot):
+        x0, y0, x1, y1 = bboxes[s.column]
+        return imagehash.phash(Image.fromarray(cache.get(s.capture_index)[y0:y1, x0:x1]))
+
+    out: list[_Snapshot] = []
+    last_in_column: dict[str, int] = {}  # column -> index into `out`
+    for s in sorted(snaps, key=lambda x: x.capture_time):
+        j = last_in_column.get(s.column)
+        if j is not None:
+            prev = out[j]
+            if (prev.board_index == s.board_index
+                    and (crop_hash(prev) - crop_hash(s)) <= phash_max):
+                merged_burst = bursts.Burst(
+                    start=prev.burst.start, end=s.burst.end,
+                    gain=prev.burst.gain + s.burst.gain,
+                )
+                out[j] = _Snapshot(
+                    column=s.column, board_index=s.board_index, burst=merged_burst,
+                    capture_index=s.capture_index, capture_time=s.capture_time,
+                    fullness=s.fullness, occlusion=s.occlusion,
+                    erased_at=s.erased_at, final=s.final or prev.final,
+                )
+                continue
+        out.append(s)
+        last_in_column[s.column] = len(out) - 1
+    return out
+
+
+def _global_color_plate(video_path, times: np.ndarray, k: int = 41) -> np.ndarray | None:
+    """Full-resolution, person-free color plate over the whole analysis range."""
     t0, t1 = float(times[0]), float(times[-1])
     span = max(t1 - t0, 1.0)
     fps_g = min(1.0, k / span)
     frames = [f for _, f in ffmpeg.decode_frames(
         video_path, fps=fps_g, start=t0, duration=span, size=None, gray=False)]
     if not frames:
-        return None  # type: ignore[return-value]
+        return None
     return background.median_plate(np.stack(frames, axis=0))
-
-
-def _cluster(indices: list[int], gap: int) -> list[list[int]]:
-    if not indices:
-        return []
-    indices = sorted(set(indices))
-    groups = [[indices[0]]]
-    for i in indices[1:]:
-        if i - groups[-1][-1] <= gap:
-            groups[-1].append(i)
-        else:
-            groups.append([i])
-    return groups
 
 
 def run_boards(
@@ -67,7 +213,7 @@ def run_boards(
     duration: float | None = None,
     cache_root: str | Path | None = None,
     rebuild: bool = False,
-) -> BoardsResult:
+) -> TimelineResult:
     video_path = Path(video_path)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -80,148 +226,122 @@ def run_boards(
         video_path, info, fps=fps, analysis_width=cfg.analysis_width,
         cache_root=cache_root, start=start, duration=duration, rebuild=rebuild,
     )
+    if cache.n == 0:
+        return TimelineResult(video=video_path.name, duration=info.duration)
+
     scale = cache.width / info.width
-    n = cache.n
-    if n == 0:
-        return BoardsResult(video=video_path.name)
+    columns = roi.panel_rois(cfg.rois)
+    if not columns:
+        columns = [roi.default_full_roi(info.width, info.height)]
+    masks = {c.name: roi.roi_mask(c, cache.height, cache.width, scale) for c in columns}
+    bboxes = {c.name: roi.scaled_bbox(c, scale, cache.width, cache.height) for c in columns}
+    full_bboxes = {c.name: roi.fullres_bbox(c, info.width, info.height) for c in columns}
 
-    # --- ROIs (panels + synthetic full-wall) ---
-    panels = roi.panel_rois(cfg.rois)
-    full = roi.default_full_roi(info.width, info.height)
-    rois_all = panels + [full]
-    masks = {r.name: roi.roi_mask(r, cache.height, cache.width, scale) for r in rois_all}
-    bboxes = {r.name: roi.scaled_bbox(r, scale, cache.width, cache.height) for r in rois_all}
-
-    # --- occlusion reference plates ---
     half = max(1, round(cfg.median_window_seconds * fps))
     grid = background.build_plate_grid(cache, half_window_frames=half)
 
-    # --- single analysis pass: fullness / occlusion / sharpness ---
-    names = [r.name for r in rois_all]
-    full_signal = {nm: np.zeros(n) for nm in names}
-    occ_signal = {nm: np.zeros(n) for nm in names}
-    sharp = np.zeros(n)
+    smooth, occ, sharp = _signals(cache, cfg, columns, masks, bboxes, grid)
 
-    for i in tqdm(range(n), desc="analysing frames", unit="f"):
-        gray = cache.get(i)
-        chalk = fullness.chalk_mask(gray, cfg.chalk_tophat_kernel, cfg.chalk_threshold)
-        pmask = person.person_foreground(gray, grid.nearest(i), dilate_px=cfg.person_dilate_px)
-        sharp[i] = cv2.Laplacian(gray, cv2.CV_64F).var()
-        for nm in names:
-            m = masks[nm]
-            area = int(m.sum())
-            full_signal[nm][i] = (np.count_nonzero(chalk & m) / area) if area else 0.0
-            occ_signal[nm][i] = (np.count_nonzero(pmask & m) / area) if area else 0.0
+    snaps: list[_Snapshot] = []
+    for c in columns:
+        nm = c.name
+        snaps.extend(_column_snapshots(nm, smooth[nm], occ[nm], sharp[nm], cache, cfg, fps))
+    snaps = _merge_near_duplicates(snaps, cache, bboxes, cfg.phash_max_distance)
+    snaps.sort(key=lambda s: s.capture_time)
 
-    smooth = {nm: fullness.smooth_signal(full_signal[nm], cfg.fullness_smooth_window) for nm in names}
+    # --- full-resolution export ---
+    boards_dir = out_dir / "boards"
+    wall_dir = out_dir / "wall"
+    for d in (boards_dir, wall_dir):
+        if d.exists():
+            shutil.rmtree(d)  # avoid mixing stale snapshots from prior runs
+        d.mkdir(parents=True)
 
-    presnap = max(1, round(cfg.keyframe_presnap_seconds * fps))
-    refractory = max(1, round(cfg.erase_refractory_seconds * fps))
-    slide_px = cfg.slide_shift_px * scale
-
-    # --- per-panel epoch detection -> candidate capture indices ---
-    detection_rois = panels if panels else [full]
-    candidates: list[int] = []
-    panel_events: dict[str, list[epochs.Event]] = {}
-    for r in detection_rois:
-        nm = r.name
-        evs = epochs.detect_events(smooth[nm], cfg.erase_min_drop, refractory)
-        # classify slide vs erase using image data
-        x0, y0, x1, y1 = bboxes[nm]
-        for ev in evs:
-            nxt = min(ev.drop_index + presnap, n - 1)
-            prev_roi = cache.get(ev.peak_index)[y0:y1, x0:x1]
-            next_roi = cache.get(nxt)[y0:y1, x0:x1]
-            is_slide, _dy = epochs.classify_slide(prev_roi, next_roi, slide_px)
-            ev.kind = "slide" if is_slide else "erase"
-        panel_events[nm] = evs
-
-        cap = epochs.capture_indices(smooth[nm], evs)
-        scores = keyframe.score_frames(
-            full_signal[nm], occ_signal[nm], sharp,
-            cfg.weight_fullness, cfg.weight_occlusion, cfg.weight_sharpness,
-        )
-        for ci in cap:
-            best = keyframe.select_best_index(scores, ci - presnap, ci + presnap + 1)
-            candidates.append(best)
-
-    # --- cluster candidate moments into full-wall keyframes ---
-    groups = _cluster(candidates, gap=presnap)
-    occ_full = occ_signal["full"]
-    reps = [min(g, key=lambda i: occ_full[i]) for g in groups]
-
-    # --- export clean full-res keyframes ---
     segmenter = None
     if cfg.person_removal == "gated_median":
         try:
             segmenter = person.YoloPersonSegmenter(cfg.seg_model)
-        except Exception as exc:  # [seg] not installed / model missing
+        except Exception as exc:
             print(f"[boards] gated_median requested but segmenter unavailable ({exc}); "
                   f"using median compositing.")
 
-    import shutil
-    keyframes_dir = out_dir / "keyframes"
-    if keyframes_dir.exists():
-        shutil.rmtree(keyframes_dir)  # avoid mixing stale keyframes from prior runs
-    full_dir = keyframes_dir / "full"
-    full_dir.mkdir(parents=True, exist_ok=True)
-    ext = cfg.export_format
-
-    # Person-free full-resolution global plate (whole-range median) for infill.
     global_plate = _global_color_plate(video_path, cache.times)
 
-    cand_objs: list[dedup.KeyframeCandidate] = []
-    for r in tqdm(reps, desc="exporting keyframes", unit="kf"):
-        t = float(cache.times[r])
-        clean = keyframe.build_clean_frame(
-            video_path, t, cfg.median_window_seconds, fps,
-            global_plate=global_plate,
-            dilate_px=cfg.person_dilate_px + 2, segmenter=segmenter,
-        )
-        cand_objs.append(dedup.KeyframeCandidate(
-            index=r, time=t, image=clean,
-            fullness=float(full_signal["full"][r]),
-            occlusion=float(occ_full[r]),
-            meta={"panels_present": [p.name for p in panels]},
-        ))
-
-    kept = dedup.deduplicate(cand_objs, cfg.phash_max_distance, cfg.ssim_tiebreak)
-
-    # --- write images, crops, montage, records ---
+    clean_cache: dict[int, np.ndarray] = {}
     records: list[dict] = []
-    montage_paths: list[Path] = []
-    montage_times: list[float] = []
-    for k, cand in enumerate(kept, start=1):
-        base = f"epoch_{k:04d}_t{_fmt_t(cand.time)}"
-        full_path = full_dir / f"{base}.{ext}"
-        cv2.imwrite(str(full_path), cand.image)
-        montage_paths.append(full_path)
-        montage_times.append(cand.time)
+    montage_imgs: list[Path] = []
+    montage_caps: list[str] = []
+    counters: dict[str, int] = {}
 
-        crop_paths: list[str] = []
-        if cfg.emit_region_crops and panels:
-            for p in panels:
-                x0, y0, x1, y1 = roi.fullres_bbox(p, info.width, info.height)
-                crop = cand.image[y0:y1, x0:x1]
-                cdir = out_dir / "keyframes" / "crops" / p.name
-                cdir.mkdir(parents=True, exist_ok=True)
-                cpath = cdir / f"{base}.{ext}"
-                cv2.imwrite(str(cpath), crop)
-                crop_paths.append(str(cpath.relative_to(out_dir)))
+    for sid, s in enumerate(tqdm(snaps, desc="exporting snapshots", unit="snap"), start=1):
+        if s.capture_index not in clean_cache:
+            clean_cache[s.capture_index] = keyframe.build_clean_frame(
+                video_path, s.capture_time, cfg.export_window_seconds, cfg.export_fps,
+                global_plate=global_plate,
+                dilate_px=cfg.person_dilate_px + 2, segmenter=segmenter,
+            )
+        clean = clean_cache[s.capture_index]
 
+        tstamp = _fmt_t(s.capture_time)
+        wall_path = wall_dir / f"t{tstamp}.{cfg.export_format}"
+        if not wall_path.exists():
+            cv2.imwrite(str(wall_path), clean)
+
+        counters[s.column] = counters.get(s.column, 0) + 1
+        col_dir = boards_dir / s.column
+        col_dir.mkdir(exist_ok=True)
+        base = f"b{s.board_index:02d}_s{counters[s.column]:02d}_t{tstamp}"
+        x0, y0, x1, y1 = full_bboxes[s.column]
+        crop = enhance.trim_to_board(clean[y0:y1, x0:x1])
+        crop_path = col_dir / f"{base}.{cfg.export_format}"
+        cv2.imwrite(str(crop_path), crop)
+
+        enh_rel = None
+        if cfg.enhance_crops:
+            enh = enhance.enhance_board_crop(crop)
+            enh_path = col_dir / f"{base}_enh.{cfg.export_format}"
+            cv2.imwrite(str(enh_path), enh)
+            enh_rel = enh_path.relative_to(out_dir).as_posix()
+
+        t_a = float(cache.times[s.burst.start])
+        t_b = float(cache.times[s.burst.end])
         records.append({
-            "id": k,
-            "time": cand.time,
-            "time_str": _fmt_t(cand.time).replace("-", ":"),
-            "image": str(full_path.relative_to(out_dir)),
-            "crops": crop_paths,
-            "fullness": round(cand.fullness, 4),
-            "occlusion": round(cand.occlusion, 4),
+            "id": sid,
+            "column": s.column,
+            "board": f"{s.column}#{s.board_index}",
+            "writing_interval": [round(t_a, 1), round(t_b, 1)],
+            "writing_interval_str": [_clock(t_a), _clock(t_b)],
+            "capture_time": round(s.capture_time, 1),
+            "capture_time_str": _clock(s.capture_time),
+            "final": s.final,
+            "final_reason": (None if not s.final
+                             else ("erased" if s.erased_at is not None
+                                   else "end_of_analysis")),
+            "erased_at": round(s.erased_at, 1) if s.erased_at is not None else None,
+            "fullness": round(s.fullness, 4),
+            "occlusion": round(s.occlusion, 4),
+            "image": crop_path.relative_to(out_dir).as_posix(),
+            "image_size": [crop.shape[1], crop.shape[0]],
+            "image_enhanced": enh_rel,
+            "wall_image": wall_path.relative_to(out_dir).as_posix(),
         })
+        montage_imgs.append(crop_path)
+        montage_caps.append(
+            f"#{sid} {s.column} b{s.board_index} [{_clock(t_a)}-{_clock(t_b)}]"
+            + (" FINAL" if s.final else "")
+        )
 
-    montage_path = None
-    if montage_paths:
-        mp = montage.make_montage(montage_paths, montage_times, out_dir / "montage.png")
-        montage_path = str(mp.relative_to(out_dir))
+    montage_rel = None
+    if montage_imgs:
+        mp = montage.make_montage(montage_imgs, montage_caps, out_dir / "montage.png")
+        montage_rel = str(mp.relative_to(out_dir))
 
-    return BoardsResult(video=video_path.name, keyframes=records, montage=montage_path)
+    return TimelineResult(
+        video=video_path.name,
+        duration=info.duration,
+        columns=[c.name for c in columns],
+        snapshots=records,
+        montage=montage_rel,
+        analysis_start=float(cache.times[0]),
+        analysis_end=float(cache.times[-1]),
+    )

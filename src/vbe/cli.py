@@ -69,9 +69,9 @@ def boards(
     duration: Optional[float] = typer.Option(None, "--duration"),
     rebuild: bool = typer.Option(False, "--rebuild", help="ignore cached frames"),
 ):
-    """Extract blackboard keyframes (full-wall + crops + montage + manifest)."""
+    """Extract the per-board writing timeline (snapshots + crops + montage)."""
     from .boards import pipeline
-    from .manifest import write_manifest
+    from .manifest import write_timeline
 
     cfg = load_config(config)
     if fps:
@@ -81,8 +81,55 @@ def boards(
     out_dir = _out_dir(out, video)
 
     result = pipeline.run_boards(video, cfg, out_dir, start=start, duration=duration, rebuild=rebuild)
-    write_manifest(out_dir, result.video, result.keyframes, montage=result.montage)
-    typer.echo(f"[boards] {len(result.keyframes)} keyframes -> {out_dir}")
+
+    boards_summary: dict[str, dict] = {}
+    for s in result.snapshots:
+        b = boards_summary.setdefault(s["board"], {
+            "column": s["column"], "snapshot_ids": [],
+            "first_writing_start": s["writing_interval"][0],
+            "erased_at": s["erased_at"], "final_snapshot_id": None,
+        })
+        b["snapshot_ids"].append(s["id"])
+        b["erased_at"] = b["erased_at"] or s["erased_at"]
+        if s["final"]:
+            b["final_snapshot_id"] = s["id"]
+
+    from datetime import datetime, timezone
+    write_timeline(out_dir, {
+        "schema_version": 2,
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "video": result.video,
+        "duration": result.duration,
+        "analysis_range": [result.analysis_start, result.analysis_end],
+        "columns": result.columns,
+        "column_geometry": {r.name: r.bbox() for r in cfg.rois},
+        "montage": result.montage,
+        "transcript_file": None,  # filled by `vbe pair`
+        "schema_notes": {
+            "snapshots": "Chronological board states. Snapshots sharing a `board` id "
+                         "are PROGRESSIVE states of the same physical board filling up; "
+                         "each later one contains the earlier content plus more. The "
+                         "`final: true` one is that board's most complete state.",
+            "writing_interval": "[start, end] in seconds from video start: when this "
+                                "content was chalked. The lecturer usually explains the "
+                                "material while writing it and just after.",
+            "capture_time": "When the snapshot image was taken (seconds; just after "
+                            "writing stopped, lecturer out of frame or removed).",
+            "board": "<column>#<n>: the n-th board on that column; n increments when "
+                     "the column is erased (or its content slides out of view).",
+            "final_reason": "erased = wiped afterwards (see erased_at); "
+                            "end_of_analysis = still standing when analysis ended.",
+            "fullness": "Fraction of column pixels that are chalk strokes; a densely "
+                        "full board measures only ~0.15-0.25 - do NOT read as percent.",
+            "occlusion": "Fraction of the column hidden by the lecturer at capture.",
+            "images": "image = tight board crop (lecturer removed); image_enhanced = "
+                      "CLAHE+sharpened grayscale variant, most legible; wall_image = "
+                      "full 1920x1080 wall for spatial context. image_size = [w, h].",
+        },
+        "snapshots": result.snapshots,
+        "boards": boards_summary,
+    })
+    typer.echo(f"[boards] {len(result.snapshots)} snapshots -> {out_dir / 'timeline.json'}")
     if result.montage:
         typer.echo(f"[boards] montage: {out_dir / 'montage.png'}")
 
@@ -132,21 +179,21 @@ def pair(
     video: Path = typer.Argument(..., exists=True, dir_okay=False),
     out: Path = typer.Option(Path("output"), "--out", "-o"),
     config: Optional[Path] = typer.Option(None, "--config", "-c"),
-    manifest: Optional[Path] = typer.Option(None, "--manifest"),
+    timeline: Optional[Path] = typer.Option(None, "--timeline"),
     transcript: Optional[Path] = typer.Option(None, "--transcript"),
 ):
-    """Attach the transcript text spoken around each keyframe to the manifest."""
-    from .pairing import pair_manifest
+    """Attach the transcript text spoken around each snapshot to the timeline."""
+    from .pairing import pair_timeline
 
     cfg = load_config(config)
     out_dir = _out_dir(out, video)
-    manifest = manifest or out_dir / "manifest.json"
+    timeline = timeline or out_dir / "timeline.json"
     transcript = transcript or out_dir / "transcript.json"
-    if not manifest.exists():
-        raise typer.BadParameter(f"manifest not found: {manifest} (run `vbe boards` first)")
+    if not timeline.exists():
+        raise typer.BadParameter(f"timeline not found: {timeline} (run `vbe boards` first)")
     if not transcript.exists():
         raise typer.BadParameter(f"transcript not found: {transcript} (run `vbe transcribe` first)")
-    p = pair_manifest(manifest, transcript, cfg.pair_margin_seconds)
+    p = pair_timeline(timeline, transcript, cfg.pair_margin_seconds)
     typer.echo(f"[pair] updated {p}")
 
 
@@ -160,9 +207,11 @@ def run_all(
     duration: Optional[float] = typer.Option(None, "--duration"),
 ):
     """Run boards + transcribe + pair end to end."""
-    boards(video, config, out, None, start, duration, False)
-    transcribe(video, config, out, device, None, start, duration)
-    pair(video, out, config, None, None)
+    boards(video, config=config, out=out, fps=None, person_removal=None,
+           start=start, duration=duration, rebuild=False)
+    transcribe(video, config=config, out=out, device=device, model=None,
+               start=start, duration=duration)
+    pair(video, out=out, config=config, timeline=None, transcript=None)
 
 
 if __name__ == "__main__":
