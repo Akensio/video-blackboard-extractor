@@ -47,19 +47,33 @@ class Config(BaseModel):
     chalk_tophat_kernel: int = 15
     chalk_threshold: int = 18
     fullness_smooth_window: int = 15
-    min_visible_fraction: float = 0.35  # below this, the column is too occluded to read
 
-    # --- writing-burst timeline ---
-    burst_rate_threshold: float = 0.00025  # fullness/sec counted as active writing
-    burst_merge_gap_seconds: float = 60.0  # talking pauses shorter than this stay in-burst
-    burst_min_gain: float = 0.012          # min fullness a burst must add to emit a snapshot
-    burst_post_window_seconds: float = 30.0  # search window after a burst for the cleanest capture
-    burst_deriv_window_seconds: float = 31.0  # smoothing window for the writing-rate derivative
+    # --- snapshot triggering (change + settle) ---
+    snapshot_change_min: float = 0.006   # changed fraction of the column that earns a snapshot
+    snapshot_cohesion_min: float = 0.55  # added cells must cluster like writing (smears scatter)
+    stable_seconds: float = 45.0         # writing pause that marks content as "settled"
+    stable_eps: float = 0.010            # state change below this over stable_seconds = settled
+    chalk_on_threshold: int = 30         # tophat level that turns a state pixel ON
+    chalk_off_threshold: int = 14        # tophat level that turns a state pixel OFF
+    state_downsample: int = 4            # chalk-state grid downsample for change diffs
+    state_min_count: int = 2             # pixels per pooled cell required (noise suppression)
+    state_debounce_frames: int = 3       # cell flips must persist this many frames
+    capture_max_occlusion: float = 0.25  # defer capture while column is this occluded
+
+    # --- lecturer presence (informational `visits` field only) ---
+    presence_threshold: float = 0.06     # column occlusion above this = he is at the column
+    presence_min_seconds: float = 4.0
+    presence_bridge_seconds: float = 8.0
+
+    # --- snapshot capture windows ---
+    capture_post_seconds: float = 30.0       # search window after a trigger for the cleanest frame
+    capture_preerase_back_seconds: float = 20.0  # backward window before an erase peak
 
     # --- full-res export ---
     export_window_seconds: float = 60.0  # backward median window for clean-frame export
     export_fps: float = 0.5              # decode fps inside that window
     enhance_crops: bool = True           # also emit CLAHE-enhanced grayscale crops
+    trim_crops: bool = False             # content-aware crop trim (off: never risk cutting chalk)
 
     # --- erase detection ---
     erase_min_drop: float = 0.35           # RELATIVE drop from the running peak

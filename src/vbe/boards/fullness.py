@@ -11,12 +11,16 @@ import cv2
 import numpy as np
 
 
-def chalk_mask(gray: np.ndarray, tophat_kernel: int, threshold: int) -> np.ndarray:
-    """Boolean mask of chalk-like bright thin strokes in a grayscale frame."""
+def chalk_levels(gray: np.ndarray, tophat_kernel: int) -> np.ndarray:
+    """White top-hat response: brightness of thin structures over local background."""
     k = max(3, tophat_kernel | 1)  # odd
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-    return tophat > threshold
+    return cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+
+
+def chalk_mask(gray: np.ndarray, tophat_kernel: int, threshold: int) -> np.ndarray:
+    """Boolean mask of chalk-like bright thin strokes in a grayscale frame."""
+    return chalk_levels(gray, tophat_kernel) > threshold
 
 
 def fullness_in_mask(gray: np.ndarray, region_mask: np.ndarray,

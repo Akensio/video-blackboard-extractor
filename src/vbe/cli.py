@@ -113,6 +113,12 @@ def boards(
             "writing_interval": "[start, end] in seconds from video start: when this "
                                 "content was chalked. The lecturer usually explains the "
                                 "material while writing it and just after.",
+            "visits": "Best-effort [start, end] stretches when the lecturer was detected "
+                      "at this column during the writing (informational; may be empty - "
+                      "his dark clothing defeats detection at times).",
+            "trigger": "What caused the capture: settled = writing stopped and the new "
+                       "content sat unchanged; pre_erase = the board was about to be "
+                       "wiped; flush = end-of-analysis safety net.",
             "capture_time": "When the snapshot image was taken (seconds; just after "
                             "writing stopped, lecturer out of frame or removed).",
             "board": "<column>#<n>: the n-th board on that column; n increments when "

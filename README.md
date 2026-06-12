@@ -9,12 +9,14 @@ front of the board.
 The output is designed as a ready-to-walk basis for LLM lecture-note generation:
 
 1. **Board timeline** - the board wall is three columns of sliding boards. Per column,
-   a chalk-fullness signal (occlusion-aware: the lecturer's pixels are excluded) is
-   segmented into *writing bursts* separated by talking pauses and *erase events*. Each
-   burst yields one snapshot: the cleanest moment right after writing stops, exported with
-   the lecturer removed, as a tight board crop + a CLAHE-enhanced legibility variant + a
-   full-wall context frame. So a half-written board during `[a,b]`, the fuller board during
-   `[c,d]`, and a fresh `board_id` after each erase.
+   the lecturer's *visits* (sustained presence, from the occlusion signal) and *erase
+   events* drive snapshot capture: when he walks away from a column, when a wipe is about
+   to start, or after a long quiet stretch, the column's chalk state is diffed against the
+   previous snapshot (slide-compensated, so boards merely sliding don't count) and a
+   snapshot is emitted only if content actually changed. Each snapshot is the cleanest
+   post-trigger moment, exported with the lecturer removed, as a full-column crop + a
+   CLAHE-enhanced legibility variant + a full-wall context frame. So a half-written board
+   during `[a,b]`, the fuller board during `[c,d]`, and a fresh `board_id` after each erase.
 2. **Transcript** - local `faster-whisper` (large-v3) transcription with VAD, word-level
    timestamps and a physics glossary, exported as `srt` / `vtt` / `txt` / `json`.
 

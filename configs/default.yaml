@@ -23,16 +23,41 @@ person_dilate_px: 9         # dilate person masks to catch arms/chalk-dust edges
 chalk_tophat_kernel: 15     # morphological top-hat kernel (px) to isolate thin strokes
 chalk_threshold: 18         # brightness above local board baseline to count as chalk
 fullness_smooth_window: 15  # Savitzky-Golay window (odd, in analysis frames)
-min_visible_fraction: 0.35  # below this visible fraction the fullness sample is interpolated
 
 # ---------------------------------------------------------------------------
-# Writing-burst timeline (the per-board write/talk/erase segmentation)
+# Snapshot triggering (change + settle)
+# A snapshot is taken when a column's chalk state has CHANGED since the last
+# snapshot (slide-compensated diff) and the writing there has SETTLED (no
+# state change for stable_seconds) - plus pre-erase forcing and an
+# end-of-analysis flush. This is robust to the lecturer's position: it watches
+# the board, not him.
 # ---------------------------------------------------------------------------
-burst_rate_threshold: 0.00025    # fullness/sec that counts as active writing
-burst_merge_gap_seconds: 60      # talking pauses shorter than this stay inside one burst
-burst_min_gain: 0.012            # min fullness a burst must add to emit a snapshot
-burst_post_window_seconds: 30    # search window after a burst for the cleanest capture
-burst_deriv_window_seconds: 31   # smoothing window for the writing-rate derivative
+snapshot_change_min: 0.006   # changed fraction of the column that earns a snapshot
+snapshot_cohesion_min: 0.55  # added cells must cluster like writing (smear streaks scatter:
+                             # measured ~0.36 vs real writing 0.71-0.95)
+stable_seconds: 45           # writing pause that marks content as "settled"
+stable_eps: 0.010            # state change below this over stable_seconds = settled
+chalk_on_threshold: 30       # tophat level that turns a state pixel ON (real strokes are
+                             # high-contrast; drying eraser smears hover near ~20)
+chalk_off_threshold: 14      # tophat level that turns a state pixel OFF
+state_downsample: 4          # chalk-state grid downsample for change diffs
+state_min_count: 2           # pixels per pooled cell required (noise suppression)
+state_debounce_frames: 3     # cell flips must persist this many frames (body-churn filter)
+capture_max_occlusion: 0.25  # defer capture while the column is this occluded (screen/person)
+
+# ---------------------------------------------------------------------------
+# Lecturer presence (informational `visits` field only; triggering does not
+# depend on it - his dark clothing makes position detection unreliable)
+# ---------------------------------------------------------------------------
+presence_threshold: 0.06
+presence_min_seconds: 4
+presence_bridge_seconds: 8
+
+# ---------------------------------------------------------------------------
+# Snapshot capture windows
+# ---------------------------------------------------------------------------
+capture_post_seconds: 30          # search window after a trigger for the cleanest frame
+capture_preerase_back_seconds: 20 # backward window before an erase peak
 
 # ---------------------------------------------------------------------------
 # Full-resolution export
@@ -40,6 +65,7 @@ burst_deriv_window_seconds: 31   # smoothing window for the writing-rate derivat
 export_window_seconds: 60        # backward median window for clean-frame export
 export_fps: 0.5                  # decode fps inside that window
 enhance_crops: true              # also emit CLAHE-enhanced grayscale crops
+trim_crops: false                # content-aware trim (off: never risk cutting chalk)
 
 # ---------------------------------------------------------------------------
 # Erase detection
