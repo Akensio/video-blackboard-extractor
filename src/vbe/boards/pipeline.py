@@ -106,10 +106,29 @@ def _signals(cache: FrameCache, cfg: Config, columns, masks, bboxes, grid):
     bright_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
     fullness_hold = np.zeros((cache.height, cache.width), dtype=bool)
     state_hold = np.zeros((cache.height, cache.width), dtype=bool)
+
+    # YOLO person mask (sampled): the heuristic diff-mask misses dark clothing
+    # against dark boards, which poisons chalk-hold and the occlusion signal.
+    # The union of both masks is used: YOLO finds him reliably, the heuristic
+    # adds fine motion coverage between YOLO samples.
+    seg_sampler = None
+    if cfg.analysis_person_mask in ("auto", "yolo"):
+        try:
+            seg = person.YoloPersonSegmenter(cfg.seg_model)
+            stride = max(1, round(cfg.analysis_seg_stride_seconds * cfg.analysis_fps))
+            seg_sampler = person.SampledPersonMask(
+                cache, seg, stride, dilate_px=cfg.person_dilate_px)
+        except Exception as exc:
+            if cfg.analysis_person_mask == "yolo":
+                raise
+            print(f"[boards] YOLO analysis mask unavailable ({exc}); heuristic only.")
+
     for i in tqdm(range(n), desc="analysing frames", unit="f"):
         gray = cache.get(i)
         lvl = fullness.chalk_levels(gray, cfg.chalk_tophat_kernel)
         pmask = person.person_foreground(gray, grid.nearest(i), dilate_px=cfg.person_dilate_px)
+        if seg_sampler is not None:
+            pmask = pmask | seg_sampler.mask(i)
         # The projector screen is an occluder too: a LARGE bright region (the
         # morphological open removes thin chalk) descending over a board must
         # freeze its state, not erase it - and captures must avoid it.
@@ -183,22 +202,29 @@ def _column_timeline(nm, f, occ_sig, sharp_sig, states, cache, cfg, fps) -> list
     def gate(i: int) -> str:
         """Classify the pending change at frame i.
 
-        'emit'  - add-dominant, writing-shaped change worth a snapshot (real
-                  chalk clusters into lines; drying smears scatter and drift
-                  symmetrically; a wipe is remove-dominant);
-        'reset' - remove-dominant change: a partial erase the 35% detector
-                  missed - re-reference silently, there is nothing to save;
+        'emit'  - the diff contains a substantial CLUSTERED added-chalk set:
+                  real writing forms line clusters, so its cohesive count is
+                  ~its full size, while drying smears and slide-compensation
+                  residue are scattered and contribute almost nothing. Misses
+                  are catastrophic and redundant snapshots are cheap, so this
+                  is deliberately the only emit condition;
+        'reset' - remove-dominant change with no written content pending: a
+                  partial erase the column-level detector missed - re-reference
+                  silently, there is nothing to save;
         'none'  - nothing significant pending.
         """
         add_m, rem_m, valid = visits.compare_states(states[i], ref_state, max_shift)
         n = max(1, int(valid.sum()))
-        add = int(add_m.sum()) / n
+        add_cohesive = visits.cohesive_count(add_m) / n
         rem = int(rem_m.sum()) / n
-        if (add >= cfg.snapshot_change_min
-                and (add >= 2 * rem or add >= 4 * cfg.snapshot_change_min)
-                and visits.cohesion(add_m) >= cfg.snapshot_cohesion_min):
+        if add_cohesive >= cfg.snapshot_change_min:
+            # Known benign artifact: a wipe drying ACROSS the analysis start
+            # can emit one empty-board snapshot (its smears brighten into
+            # cohesive streaks). Image-level smear gates were tried and
+            # rejected - they can also kill real sparse writing, and a
+            # redundant frame is cheap while lost content is not.
             return "emit"
-        if rem >= 4 * cfg.snapshot_change_min and add < cfg.snapshot_change_min:
+        if rem >= 4 * cfg.snapshot_change_min:
             return "reset"
         return "none"
 

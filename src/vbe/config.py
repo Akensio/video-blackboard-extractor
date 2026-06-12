@@ -39,6 +39,8 @@ class Config(BaseModel):
 
     # --- lecturer removal ---
     person_removal: str = "median"  # median | gated_median | none
+    analysis_person_mask: str = "auto"  # auto | yolo | heuristic (analysis-pass mask)
+    analysis_seg_stride_seconds: float = 4.0  # YOLO sampling stride for the analysis mask
     median_window_seconds: float = 90.0
     seg_model: str = "yolov8n-seg.pt"
     person_dilate_px: int = 9
@@ -50,7 +52,8 @@ class Config(BaseModel):
 
     # --- snapshot triggering (change + settle) ---
     snapshot_change_min: float = 0.006   # changed fraction of the column that earns a snapshot
-    snapshot_cohesion_min: float = 0.55  # added cells must cluster like writing (smears scatter)
+    # (the emit gate counts COHESIVE added cells against snapshot_change_min;
+    # scattered smear/slide-residue cells contribute ~nothing by construction)
     stable_seconds: float = 45.0         # writing pause that marks content as "settled"
     stable_eps: float = 0.010            # state change below this over stable_seconds = settled
     chalk_on_threshold: int = 30         # tophat level that turns a state pixel ON
@@ -76,7 +79,7 @@ class Config(BaseModel):
     trim_crops: bool = False             # content-aware crop trim (off: never risk cutting chalk)
 
     # --- erase detection ---
-    erase_min_drop: float = 0.35           # RELATIVE drop from the running peak
+    erase_min_drop: float = 0.25           # RELATIVE drop from the running peak
     erase_refractory_seconds: float = 20.0
     erase_min_peak: float = 0.03           # boards emptier than this never "erase"
     erase_persist_seconds: float = 10.0    # the drop must hold this long

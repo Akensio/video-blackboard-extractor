@@ -13,6 +13,8 @@ export_format: png         # png (lossless, recommended) or jpg
 # Lecturer removal / background reconstruction
 # ---------------------------------------------------------------------------
 person_removal: median      # median | gated_median | none
+analysis_person_mask: auto  # auto | yolo | heuristic; yolo fixes dark-clothes misses
+analysis_seg_stride_seconds: 4  # YOLO sampling stride for the analysis mask
 median_window_seconds: 90   # temporal window (+/-) for the per-pixel median plate
 seg_model: yolov8n-seg.pt   # used only when person_removal == gated_median ([seg] extra)
 person_dilate_px: 9         # dilate person masks to catch arms/chalk-dust edges
@@ -32,9 +34,9 @@ fullness_smooth_window: 15  # Savitzky-Golay window (odd, in analysis frames)
 # end-of-analysis flush. This is robust to the lecturer's position: it watches
 # the board, not him.
 # ---------------------------------------------------------------------------
-snapshot_change_min: 0.006   # changed fraction of the column that earns a snapshot
-snapshot_cohesion_min: 0.55  # added cells must cluster like writing (smear streaks scatter:
-                             # measured ~0.36 vs real writing 0.71-0.95)
+snapshot_change_min: 0.006   # COHESIVE added-cell fraction that earns a snapshot (real
+                             # writing clusters into lines, so ~its full count passes;
+                             # scattered smear/slide-residue cells contribute ~nothing)
 stable_seconds: 45           # writing pause that marks content as "settled"
 stable_eps: 0.010            # state change below this over stable_seconds = settled
 chalk_on_threshold: 30       # tophat level that turns a state pixel ON (real strokes are
@@ -70,7 +72,9 @@ trim_crops: false                # content-aware trim (off: never risk cutting c
 # ---------------------------------------------------------------------------
 # Erase detection
 # ---------------------------------------------------------------------------
-erase_min_drop: 0.35        # RELATIVE fullness drop from the running peak (wipes remove most chalk)
+erase_min_drop: 0.25        # RELATIVE fullness drop from the running peak. Wiping ONE of a
+                            # column's two boards drops the column ~30-50%; partial-line
+                            # corrections stay well below 25%.
 erase_refractory_seconds: 20  # min spacing between detected events
 erase_min_peak: 0.03        # boards emptier than this never produce erase events
 erase_persist_seconds: 10   # the drop must hold this long (rejects occlusion transients)

@@ -205,6 +205,24 @@ def cohesion(cells: np.ndarray) -> float:
     return float((neighbours[cells] >= 2).mean())
 
 
+def cohesive_count(cells: np.ndarray) -> int:
+    """Number of True cells having >= 2 True 8-neighbours (clustered cells).
+
+    The gate quantity for "is there real written content here": scattered
+    smear/flicker cells contribute ~nothing, line-shaped chalk contributes
+    nearly its full count. Robust where a partially-compensated board slide
+    mixes scattered residue into the diff - the residue dilutes a cohesion
+    RATIO but barely moves the cohesive COUNT of genuinely written cells.
+    """
+    cells = cells.astype(bool)
+    if not cells.any():
+        return 0
+    neighbours = cv2.filter2D(cells.astype(np.uint8), -1,
+                              np.ones((3, 3), np.uint8),
+                              borderType=cv2.BORDER_CONSTANT) - cells
+    return int((neighbours[cells] >= 2).sum())
+
+
 def change_fraction(
     current: np.ndarray,
     reference: np.ndarray,

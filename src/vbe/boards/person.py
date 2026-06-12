@@ -40,7 +40,8 @@ def occlusion_in_mask(person_mask: np.ndarray, region_mask: np.ndarray) -> float
 class YoloPersonSegmenter:
     """Optional person segmentation via ultralytics YOLO ([seg] extra).
 
-    Operates on full-resolution BGR frames (used by the gated-median export).
+    Operates on BGR frames (any resolution): used by the gated-median export
+    and, sampled, by the analysis-time mask.
     """
 
     def __init__(self, model_name: str = "yolov8n-seg.pt"):
@@ -60,3 +61,36 @@ class YoloPersonSegmenter:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
             out = cv2.dilate(out, k)
         return out.astype(bool)
+
+
+class SampledPersonMask:
+    """YOLO person masks on a coarse time grid for the analysis pass.
+
+    Running the segmenter on every analysis frame is wasteful - the lecturer
+    moves slowly relative to 1 fps. Masks are computed every `stride` frames
+    and a query returns the UNION of the two samples bracketing the frame, so
+    his position anywhere between the samples is covered. Lazy + cached, so
+    cost is ~n/stride inferences per video.
+    """
+
+    def __init__(self, cache, segmenter: YoloPersonSegmenter,
+                 stride: int, dilate_px: int = 9):
+        self.cache = cache
+        self.segmenter = segmenter
+        self.stride = max(1, stride)
+        self.dilate_px = dilate_px
+        self._samples: dict[int, np.ndarray] = {}
+
+    def _sample(self, slot: int) -> np.ndarray:
+        if slot not in self._samples:
+            i = min(slot * self.stride, self.cache.n - 1)
+            bgr = cv2.cvtColor(self.cache.get(i), cv2.COLOR_GRAY2BGR)
+            self._samples[slot] = self.segmenter.mask(bgr, dilate_px=self.dilate_px)
+        return self._samples[slot]
+
+    def mask(self, i: int) -> np.ndarray:
+        slot = i // self.stride
+        m = self._sample(slot)
+        if (slot + 1) * self.stride < self.cache.n:
+            m = m | self._sample(slot + 1)
+        return m
