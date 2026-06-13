@@ -205,22 +205,27 @@ def cohesion(cells: np.ndarray) -> float:
     return float((neighbours[cells] >= 2).mean())
 
 
-def cohesive_count(cells: np.ndarray) -> int:
-    """Number of True cells having >= 2 True 8-neighbours (clustered cells).
+def cohesive_mask(cells: np.ndarray) -> np.ndarray:
+    """Boolean mask of True cells having >= 2 True 8-neighbours (clustered cells).
 
-    The gate quantity for "is there real written content here": scattered
-    smear/flicker cells contribute ~nothing, line-shaped chalk contributes
-    nearly its full count. Robust where a partially-compensated board slide
-    mixes scattered residue into the diff - the residue dilutes a cohesion
-    RATIO but barely moves the cohesive COUNT of genuinely written cells.
+    Handwriting forms connected line-clusters; scattered smear/flicker cells
+    have few neighbours and drop out. Used both to gate snapshots (is there
+    real written content?) and to locate WHERE the new writing is.
     """
     cells = cells.astype(bool)
     if not cells.any():
-        return 0
+        return np.zeros_like(cells)
     neighbours = cv2.filter2D(cells.astype(np.uint8), -1,
                               np.ones((3, 3), np.uint8),
                               borderType=cv2.BORDER_CONSTANT) - cells
-    return int((neighbours[cells] >= 2).sum())
+    out = np.zeros_like(cells)
+    out[cells] = neighbours[cells] >= 2
+    return out
+
+
+def cohesive_count(cells: np.ndarray) -> int:
+    """Number of clustered (line-shaped) True cells - see cohesive_mask."""
+    return int(cohesive_mask(cells).sum())
 
 
 def change_fraction(

@@ -51,7 +51,7 @@ class Config(BaseModel):
     fullness_smooth_window: int = 15
 
     # --- snapshot triggering (change + settle) ---
-    snapshot_change_min: float = 0.006   # changed fraction of the column that earns a snapshot
+    snapshot_change_min: float = 0.006   # changed fraction of the board that earns a snapshot
     # (the emit gate counts COHESIVE added cells against snapshot_change_min;
     # scattered smear/slide-residue cells contribute ~nothing by construction)
     stable_seconds: float = 45.0         # writing pause that marks content as "settled"
@@ -61,10 +61,15 @@ class Config(BaseModel):
     state_downsample: int = 4            # chalk-state grid downsample for change diffs
     state_min_count: int = 2             # pixels per pooled cell required (noise suppression)
     state_debounce_frames: int = 3       # cell flips must persist this many frames
-    capture_max_occlusion: float = 0.25  # defer capture while column is this occluded
+    capture_max_occlusion: float = 0.25  # defer capture while board is this occluded
+    # Vertical slide compensation for change diffs, in pooled cells. 0 = off:
+    # with one ROI per physical board (boards erased in place, never slid) a
+    # slide cannot move content within a board, so compensation can only mask
+    # real writing. Raise only for halls where boards genuinely slide.
+    change_slide_max_cells: int = 0
 
     # --- lecturer presence (informational `visits` field only) ---
-    presence_threshold: float = 0.06     # column occlusion above this = he is at the column
+    presence_threshold: float = 0.06     # board occlusion above this = he is at the board
     presence_min_seconds: float = 4.0
     presence_bridge_seconds: float = 8.0
 

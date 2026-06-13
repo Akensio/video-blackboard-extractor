@@ -28,11 +28,10 @@ fullness_smooth_window: 15  # Savitzky-Golay window (odd, in analysis frames)
 
 # ---------------------------------------------------------------------------
 # Snapshot triggering (change + settle)
-# A snapshot is taken when a column's chalk state has CHANGED since the last
-# snapshot (slide-compensated diff) and the writing there has SETTLED (no
-# state change for stable_seconds) - plus pre-erase forcing and an
-# end-of-analysis flush. This is robust to the lecturer's position: it watches
-# the board, not him.
+# A snapshot is taken when a board's chalk state has CHANGED since the last
+# snapshot and the writing there has SETTLED (no state change for
+# stable_seconds) - plus pre-erase forcing and an end-of-analysis flush. This
+# is robust to the lecturer's position: it watches the board, not him.
 # ---------------------------------------------------------------------------
 snapshot_change_min: 0.006   # COHESIVE added-cell fraction that earns a snapshot (real
                              # writing clusters into lines, so ~its full count passes;
@@ -45,7 +44,9 @@ chalk_off_threshold: 14      # tophat level that turns a state pixel OFF
 state_downsample: 4          # chalk-state grid downsample for change diffs
 state_min_count: 2           # pixels per pooled cell required (noise suppression)
 state_debounce_frames: 3     # cell flips must persist this many frames (body-churn filter)
-capture_max_occlusion: 0.25  # defer capture while the column is this occluded (screen/person)
+capture_max_occlusion: 0.25  # defer capture while the board is this occluded (screen/person)
+change_slide_max_cells: 0    # vertical slide compensation (pooled cells); 0 = off. One ROI
+                             # per in-place board => no sliding, so leave 0 (see config note)
 
 # ---------------------------------------------------------------------------
 # Lecturer presence (informational `visits` field only; triggering does not

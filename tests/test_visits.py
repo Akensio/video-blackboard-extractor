@@ -99,6 +99,17 @@ def test_change_shape_mismatch_is_full_change():
     assert visits.change_fraction(np.zeros((4, 4), bool), np.zeros((5, 5), bool)) >= 1.0
 
 
+def test_cohesive_mask_keeps_clusters_drops_specks():
+    cells = np.zeros((20, 20), dtype=bool)
+    cells[5:9, 5:9] = True                 # a 4x4 written block (clustered)
+    cells[15, 2] = True                    # an isolated speck
+    cells[1, 18] = True                    # another speck
+    m = visits.cohesive_mask(cells)
+    assert m[6:8, 6:8].all()               # interior of the block survives
+    assert not m[15, 2] and not m[1, 18]   # specks dropped
+    assert visits.cohesive_count(cells) == int(m.sum())
+
+
 def test_added_removed_distinguishes_writing_from_wipe():
     ref = _state(density=0.15)
     written = ref.copy()

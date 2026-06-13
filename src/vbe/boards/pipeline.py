@@ -1,16 +1,15 @@
-"""Board-timeline extraction orchestrator.
+"""Board-snapshot extraction orchestrator.
 
-Per column of boards (the camera wall has three), this builds the lecture's
-writing timeline:
+Mimics a student photographing a board when the lecturer finishes it:
 
   decode low-fps frames -> per-column chalk-hold state + occlusion signals
-  -> lecturer VISITS (sustained presence at a column) and erase events
-  -> snapshot triggers: visit ends, imminent erases, quiet-time flushes -
-     each gated by "did the column's chalk actually change since the last
-     snapshot" (slide-compensated diff, so moved-but-unchanged content
-     doesn't count)
-  -> full-res lecturer-removed export: column crop (+ enhanced) + wall context
-  -> timeline.json: chronological snapshots with writing intervals.
+  -> per column, detect "a board was finished" = real new chalk appeared and
+     then stopped changing for a while (he stepped away)
+  -> capture the cleanest frame, crop the SINGLE board the fresh chalk is on
+     (rail-to-rail, lecturer removed) -> board crop (+ enhanced) + wall context
+  -> timeline.json: chronological one-board-each snapshots with writing
+     intervals. No erase/lifecycle bookkeeping; a wipe-and-rewrite just yields
+     another finished board.
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ from tqdm import tqdm
 from ..config import Config
 from ..io import ffmpeg
 from ..io.frame_cache import FrameCache
-from . import background, enhance, epochs, fullness, keyframe, montage, person, roi, visits
+from . import background, enhance, fullness, keyframe, montage, person, roi, visits
 
 
 def _fmt_t(seconds: float) -> str:
@@ -52,18 +51,14 @@ class TimelineResult:
 
 @dataclass
 class _Snapshot:
-    column: str
-    board_index: int          # 1-based, increments at each erase in the column
+    column: str               # analysis zone the board sits in (left/center/right)
     write_start_i: int        # analysis-frame index: content began appearing
     write_end_i: int          # analysis-frame index: content was complete
-    capture_index: int
+    capture_index: int        # analysis-frame index the photo is taken at
     capture_time: float
-    fullness: float
     occlusion: float
-    trigger: str              # visit_end | pre_erase | flush
+    added_mask: np.ndarray    # pooled state grid: clustered cells of fresh chalk
     visit_spans: list[tuple[int, int]] = field(default_factory=list)
-    erased_at: float | None = None
-    final: bool = False
 
 
 def _signals(cache: FrameCache, cfg: Config, columns, masks, bboxes, grid):
@@ -164,183 +159,87 @@ def _signals(cache: FrameCache, cfg: Config, columns, masks, bboxes, grid):
 
 
 def _column_timeline(nm, f, occ_sig, sharp_sig, states, cache, cfg, fps) -> list[_Snapshot]:
-    """Settle / pre-erase / flush triggers -> change-gated snapshots for one column.
+    """Emit one snapshot per FINISHED board in this column.
 
-    The trigger watches the BOARD, not the lecturer: when the column's chalk
-    state has changed since the last snapshot and then stops changing for
-    `stable_seconds`, the content is "settled" and gets captured. (His dark
-    clothing makes position-based triggering unreliable; presence is recorded
-    only as informational `visits`.)
+    Mimics "take a picture when the professor finishes a board": when the
+    column's chalk state has gained real new writing since the last snapshot
+    and then stops changing for `stable_seconds` (he stepped away), capture it.
+    The crop is later restricted to the single board the new chalk sits on, so
+    sliding and the upper/lower boundary never matter here. No erase / lifecycle
+    bookkeeping - a wipe-and-rewrite simply produces another finished board.
     """
     n = len(f)
-    refractory = max(1, round(cfg.erase_refractory_seconds * fps))
-    persist = max(1, round(cfg.erase_persist_seconds * fps))
-    events = epochs.detect_events(
-        f, cfg.erase_min_drop, refractory,
-        min_peak=cfg.erase_min_peak, persist_frames=persist,
-    )
-    erase_idx = [e.drop_index for e in events]
-
     presence_runs = visits.segment_visits(
         occ_sig > cfg.presence_threshold, fps,
         cfg.presence_min_seconds, cfg.presence_bridge_seconds,
     )
-
     scores = keyframe.score_frames(
         f, occ_sig, sharp_sig,
         cfg.weight_fullness, cfg.weight_occlusion, cfg.weight_sharpness,
     )
     post = max(1, round(cfg.capture_post_seconds * fps))
-    back = max(1, round(cfg.capture_preerase_back_seconds * fps))
     stable_w = max(1, round(cfg.stable_seconds * fps))
-    max_shift = max(2, states.shape[1] // 2)  # boards slide up to ~half the column
 
     ref_state = states[0]
     ref_reset_i = 0
     snaps: list[_Snapshot] = []
 
-    def gate(i: int) -> str:
-        """Classify the pending change at frame i.
+    def added_mask(i: int) -> np.ndarray:
+        """Clustered cells of fresh chalk at frame i vs the last snapshot."""
+        add_m, _rem, _valid = visits.compare_states(states[i], ref_state, max_shift=0)
+        return visits.cohesive_mask(add_m)
 
-        'emit'  - the diff contains a substantial CLUSTERED added-chalk set:
-                  real writing forms line clusters, so its cohesive count is
-                  ~its full size, while drying smears and slide-compensation
-                  residue are scattered and contribute almost nothing. Misses
-                  are catastrophic and redundant snapshots are cheap, so this
-                  is deliberately the only emit condition;
-        'reset' - remove-dominant change with no written content pending: a
-                  partial erase the column-level detector missed - re-reference
-                  silently, there is nothing to save;
-        'none'  - nothing significant pending.
-        """
-        add_m, rem_m, valid = visits.compare_states(states[i], ref_state, max_shift)
-        n = max(1, int(valid.sum()))
-        add_cohesive = visits.cohesive_count(add_m) / n
-        rem = int(rem_m.sum()) / n
-        if add_cohesive >= cfg.snapshot_change_min:
-            # Known benign artifact: a wipe drying ACROSS the analysis start
-            # can emit one empty-board snapshot (its smears brighten into
-            # cohesive streaks). Image-level smear gates were tried and
-            # rejected - they can also kill real sparse writing, and a
-            # redundant frame is cheap while lost content is not.
-            return "emit"
-        if rem >= 4 * cfg.snapshot_change_min:
-            return "reset"
-        return "none"
-
-    def emit(ci: int, trigger: str) -> None:
+    def emit(ci: int) -> None:
         nonlocal ref_state, ref_reset_i
-        board_index = 1 + sum(1 for e in erase_idx if e <= ci)
-        # When did this content appear? From the cumulative ADDED-chalk curve.
-        curve = np.array([visits.added_removed(states[j], ref_state, max_shift)[0]
+        add = added_mask(ci)
+        # When did this content appear? From the cumulative added-chalk curve.
+        curve = np.array([visits.added_removed(states[j], ref_state, 0)[0]
                           for j in range(ref_reset_i, ci + 1)])
         ws, we = visits.writing_window(curve, floor=0.5 * cfg.snapshot_change_min)
         write_start_i, write_end_i = ref_reset_i + ws, ref_reset_i + we
         spans = [(v.start, v.end) for v in presence_runs
                  if v.end >= write_start_i and v.start <= write_end_i]
-        nxt_drop = next((e for e in erase_idx if e > ci), None)
         snaps.append(_Snapshot(
-            column=nm, board_index=board_index,
-            write_start_i=write_start_i, write_end_i=write_end_i,
+            column=nm, write_start_i=write_start_i, write_end_i=write_end_i,
             capture_index=ci, capture_time=float(cache.times[ci]),
-            fullness=float(f[ci]), occlusion=float(occ_sig[ci]),
-            trigger=trigger,
-            visit_spans=spans,
-            erased_at=float(cache.times[nxt_drop]) if nxt_drop is not None else None,
+            occlusion=float(occ_sig[ci]), added_mask=add, visit_spans=spans,
         ))
         ref_state = states[ci]
         ref_reset_i = ci
 
-    next_event = 0
+    def has_new_writing(i: int) -> bool:
+        return int(added_mask(i).sum()) / states[i].size >= cfg.snapshot_change_min
+
     i = stable_w
     while i < n:
-        # Process any erase whose drop we just reached: capture the pre-wipe
-        # state from a backward window ending at the fullness peak. The gate
-        # is evaluated at the PEAK (is there content worth saving), while the
-        # photo is the best-scored frame in the backward window.
-        if next_event < len(events) and events[next_event].drop_index <= i:
-            ev = events[next_event]
-            next_event += 1
-            lo = max(ref_reset_i + 1, ev.peak_index - back)
-            hi = ev.peak_index + 1
-            if hi > lo and gate(ev.peak_index) == "emit":
-                ci = keyframe.select_best_index(scores, lo, hi)
-                emit(ci, "pre_erase")
-            # The wipe invalidates the reference whether or not we emitted.
-            j = min(ev.drop_index + persist, n - 1)
-            ref_state = states[j]
-            ref_reset_i = j
-            i = max(i, j + 1)
-            continue
-
         settled = (np.count_nonzero(states[i] ^ states[i - stable_w])
                    / states[i].size) < cfg.stable_eps
         if settled:
-            # Defer while the column is blocked (projector screen down, or the
-            # lecturer camped in front): the pending change persists, and the
-            # capture fires at the next unblocked settle point.
+            # Defer while the board is blocked (projector screen down, or the
+            # lecturer camped in front): capture at the next unblocked settle.
             if occ_sig[i] > cfg.capture_max_occlusion:
                 i += 1
                 continue
-            g = gate(i)
-            if g == "emit":
+            if has_new_writing(i):
                 hi = min(i + post + 1, n)
-                nxt_ev = next((e for e in events if e.drop_index > i), None)
-                if nxt_ev is not None:
-                    hi = min(hi, max(nxt_ev.peak_index + 1, i + 1))
                 ci = keyframe.select_best_index(scores, i, max(hi, i + 1))
-                emit(ci, "settled")
+                emit(ci)
                 i = max(i + 1, ci + 1)
                 continue
-            if g == "reset":
+            # Big erase with nothing newly written: re-reference so the next
+            # board's writing window doesn't span the wipe.
+            _add, rem, valid = visits.compare_states(states[i], ref_state, 0)
+            if int(rem.sum()) / max(1, int(valid.sum())) >= 4 * cfg.snapshot_change_min:
                 ref_state = states[i]
                 ref_reset_i = i
         i += 1
 
-    # End-of-analysis flush: capture whatever changed but never settled.
+    # End-of-analysis flush: a board left finished but never re-touched.
     lo = max(ref_reset_i, n - 1 - post)
     ci = keyframe.select_best_index(scores, lo, n)
-    if gate(ci) == "emit":
-        emit(ci, "flush")
-
-    # final = last snapshot of each board in this column
-    for i, s in enumerate(snaps):
-        s.final = not any(t.board_index == s.board_index for t in snaps[i + 1:])
+    if has_new_writing(n - 1):
+        emit(ci)
     return snaps
-
-
-def _merge_near_duplicates(snaps: list[_Snapshot], cache: FrameCache, bboxes,
-                           phash_max: int) -> list[_Snapshot]:
-    """Backstop: within a column, merge consecutive snapshots whose content is
-    near-identical. The later snapshot wins; its writing interval extends back."""
-    import imagehash
-    from PIL import Image
-
-    def crop_hash(s: _Snapshot):
-        x0, y0, x1, y1 = bboxes[s.column]
-        return imagehash.phash(Image.fromarray(cache.get(s.capture_index)[y0:y1, x0:x1]))
-
-    out: list[_Snapshot] = []
-    last_in_column: dict[str, int] = {}  # column -> index into `out`
-    for s in sorted(snaps, key=lambda x: x.capture_time):
-        j = last_in_column.get(s.column)
-        if j is not None:
-            prev = out[j]
-            if (prev.board_index == s.board_index
-                    and (crop_hash(prev) - crop_hash(s)) <= phash_max):
-                out[j] = _Snapshot(
-                    column=s.column, board_index=s.board_index,
-                    write_start_i=prev.write_start_i, write_end_i=s.write_end_i,
-                    capture_index=s.capture_index, capture_time=s.capture_time,
-                    fullness=s.fullness, occlusion=s.occlusion,
-                    trigger=s.trigger,
-                    visit_spans=prev.visit_spans + s.visit_spans,
-                    erased_at=s.erased_at, final=s.final or prev.final,
-                )
-                continue
-        out.append(s)
-        last_in_column[s.column] = len(out) - 1
-    return out
 
 
 def _global_color_plate(video_path, times: np.ndarray, k: int = 41) -> np.ndarray | None:
@@ -397,7 +296,6 @@ def run_boards(
         nm = c.name
         snaps.extend(_column_timeline(
             nm, smooth[nm], occ[nm], sharp[nm], states[nm], cache, cfg, fps))
-    snaps = _merge_near_duplicates(snaps, cache, bboxes, cfg.phash_max_distance)
     snaps.sort(key=lambda s: s.capture_time)
 
     # --- full-resolution export ---
@@ -418,13 +316,16 @@ def run_boards(
 
     global_plate = _global_color_plate(video_path, cache.times)
 
+    k = cfg.state_downsample
+    cell_min = cfg.snapshot_change_min  # per-board added-cell fraction to emit a board
     clean_cache: dict[int, np.ndarray] = {}
     records: list[dict] = []
     montage_imgs: list[Path] = []
     montage_caps: list[str] = []
     counters: dict[str, int] = {}
+    sid = 0
 
-    for sid, s in enumerate(tqdm(snaps, desc="exporting snapshots", unit="snap"), start=1):
+    for s in tqdm(snaps, desc="exporting boards", unit="capture"):
         if s.capture_index not in clean_cache:
             clean_cache[s.capture_index] = keyframe.build_clean_frame(
                 video_path, s.capture_time, cfg.export_window_seconds, cfg.export_fps,
@@ -438,55 +339,71 @@ def run_boards(
         if not wall_path.exists():
             cv2.imwrite(str(wall_path), clean)
 
-        counters[s.column] = counters.get(s.column, 0) + 1
-        col_dir = boards_dir / s.column
-        col_dir.mkdir(exist_ok=True)
-        base = f"b{s.board_index:02d}_s{counters[s.column]:02d}_t{tstamp}"
-        x0, y0, x1, y1 = full_bboxes[s.column]
-        crop = clean[y0:y1, x0:x1]
-        if cfg.trim_crops:
-            crop = enhance.trim_to_board(crop)
-        crop_path = col_dir / f"{base}.{cfg.export_format}"
-        cv2.imwrite(str(crop_path), crop)
+        fx0, fy0, fx1, fy1 = full_bboxes[s.column]
+        col_img = clean[fy0:fy1, fx0:fx1]
+        col_gray = cv2.cvtColor(col_img, cv2.COLOR_BGR2GRAY)
+        h_col = fy1 - fy0
+        ngrid = s.added_mask.shape[0]
 
-        enh_rel = None
-        if cfg.enhance_crops:
-            enh = enhance.enhance_board_crop(crop)
-            enh_path = col_dir / f"{base}_enh.{cfg.export_format}"
-            cv2.imwrite(str(enh_path), enh)
-            enh_rel = enh_path.relative_to(out_dir).as_posix()
+        # Split the column at its wooden rail into the boards visible right now,
+        # then emit each board that received fresh chalk as its OWN photo.
+        rail_local = enhance.find_rail(col_gray)
+        if rail_local is None:
+            cells = [(0, h_col, "board")]
+        else:
+            gr = max(1, min(ngrid - 1, round(rail_local / h_col * ngrid)))
+            cells = [(0, rail_local, "upper", slice(0, gr)),
+                     (rail_local, h_col, "lower", slice(gr, ngrid))]
 
         t_a = float(cache.times[s.write_start_i])
         t_b = float(cache.times[s.write_end_i])
-        records.append({
-            "id": sid,
-            "column": s.column,
-            "board": f"{s.column}#{s.board_index}",
-            "writing_interval": [round(t_a, 1), round(t_b, 1)],
-            "writing_interval_str": [_clock(t_a), _clock(t_b)],
-            "visits": [[round(float(cache.times[a]), 1), round(float(cache.times[b]), 1)]
-                       for a, b in s.visit_spans],
-            "trigger": s.trigger,
-            "capture_time": round(s.capture_time, 1),
-            "capture_time_str": _clock(s.capture_time),
-            "final": s.final,
-            "final_reason": (None if not s.final
-                             else ("erased" if s.erased_at is not None
-                                   else "end_of_analysis")),
-            "erased_at": round(s.erased_at, 1) if s.erased_at is not None else None,
-            "fullness": round(s.fullness, 4),
-            "occlusion": round(s.occlusion, 4),
-            "image": crop_path.relative_to(out_dir).as_posix(),
-            "image_size": [crop.shape[1], crop.shape[0]],
-            "image_enhanced": enh_rel,
-            "wall_image": wall_path.relative_to(out_dir).as_posix(),
-        })
-        montage_imgs.append(crop_path)
-        montage_caps.append(
-            f"#{sid} {s.column} b{s.board_index} [{_clock(t_a)}-{_clock(t_b)}]"
-            + (" FINAL" if s.final else "")
-            + (" pre-erase" if s.trigger == "pre_erase" else "")
-        )
+        for cell in cells:
+            if len(cell) == 4:
+                top, bot, vertical, grid_rows = cell
+                added_here = int(s.added_mask[grid_rows].sum())
+            else:
+                top, bot, vertical = cell
+                added_here = int(s.added_mask.sum())
+            if added_here / s.added_mask.size < cell_min:
+                continue  # this board got no real new writing - skip it
+
+            crop = col_img[top:bot]
+            location = f"{s.column}_{vertical}" if vertical != "board" else s.column
+            sid += 1
+            counters[location] = counters.get(location, 0) + 1
+            col_dir = boards_dir / s.column
+            col_dir.mkdir(exist_ok=True)
+            base = f"{vertical}_{counters[location]:02d}_t{tstamp}"
+            crop_path = col_dir / f"{base}.{cfg.export_format}"
+            cv2.imwrite(str(crop_path), crop)
+
+            enh_rel = None
+            if cfg.enhance_crops:
+                enh = enhance.enhance_board_crop(crop)
+                enh_path = col_dir / f"{base}_enh.{cfg.export_format}"
+                cv2.imwrite(str(enh_path), enh)
+                enh_rel = enh_path.relative_to(out_dir).as_posix()
+
+            records.append({
+                "id": sid,
+                "column": s.column,
+                "vertical": vertical,
+                "location": location,
+                "writing_interval": [round(t_a, 1), round(t_b, 1)],
+                "writing_interval_str": [_clock(t_a), _clock(t_b)],
+                "visits": [[round(float(cache.times[a]), 1), round(float(cache.times[b]), 1)]
+                           for a, b in s.visit_spans],
+                "capture_time": round(s.capture_time, 1),
+                "capture_time_str": _clock(s.capture_time),
+                "occlusion": round(s.occlusion, 4),
+                "image": crop_path.relative_to(out_dir).as_posix(),
+                "image_size": [crop.shape[1], crop.shape[0]],
+                "image_enhanced": enh_rel,
+                "wall_image": wall_path.relative_to(out_dir).as_posix(),
+            })
+            montage_imgs.append(crop_path)
+            montage_caps.append(f"#{sid} {location} {_clock(s.capture_time)} "
+                                f"[wrote {_clock(t_a)}-{_clock(t_b)}]")
 
     montage_rel = None
     if montage_imgs:

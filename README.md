@@ -1,28 +1,27 @@
 # video-blackboard-extractor (`vbe`)
 
-Extract a **per-board writing timeline** (clean, legible board snapshots with the time
-intervals during which they were written) and a **timestamped transcript** from
-static-camera lecture recordings. Built for ~2-hour physics lectures filmed with a fixed
-wide shot of a wall of sliding chalk blackboards, where a lecturer periodically walks in
-front of the board.
+Extract **single-board snapshots** (clean, legible photos of each board the lecturer
+finishes, with the time interval during which it was written) and a **timestamped
+transcript** from static-camera lecture recordings. Built for ~2-hour physics lectures
+filmed with a fixed wide shot of a wall of sliding chalk blackboards, where a lecturer
+periodically walks in front of the board.
 
 The output is designed as a ready-to-walk basis for LLM lecture-note generation:
 
-1. **Board timeline** - the board wall is three columns of sliding boards. Per column,
-   the lecturer's *visits* (sustained presence, from the occlusion signal) and *erase
-   events* drive snapshot capture: when he walks away from a column, when a wipe is about
-   to start, or after a long quiet stretch, the column's chalk state is diffed against the
-   previous snapshot (slide-compensated, so boards merely sliding don't count) and a
-   snapshot is emitted only if content actually changed. Each snapshot is the cleanest
-   post-trigger moment, exported with the lecturer removed, as a full-column crop + a
-   CLAHE-enhanced legibility variant + a full-wall context frame. So a half-written board
-   during `[a,b]`, the fuller board during `[c,d]`, and a fresh `board_id` after each erase.
+1. **Board snapshots** - mimics a student photographing a board once the lecturer finishes
+   it. The wall is watched as three columns; when a column gains real new chalk and then
+   stops changing for a while (he stepped away), the cleanest frame is captured, the
+   lecturer is removed, the column is split at its wooden rail, and **each board that got
+   fresh writing is exported as its own single-board image** (+ a CLAHE-enhanced legibility
+   variant), plus a full-wall context frame. The rail is found per-frame, so vertical
+   sliding of the boards never matters. No erase/lifecycle bookkeeping: if a board is later
+   filled more, or wiped and rewritten, that simply produces another finished-board photo.
 2. **Transcript** - local `faster-whisper` (large-v3) transcription with VAD, word-level
    timestamps and a physics glossary, exported as `srt` / `vtt` / `txt` / `json`.
 
-`timeline.json` ties it together: chronological snapshots, each with its
-`writing_interval`, board lifecycle (`board`, `final`, `erased_at`) and - after `vbe pair` -
-the transcript text spoken while that content was being written and explained.
+`timeline.json` ties it together: chronological one-board-each snapshots, each with its
+`column`/`vertical`/`location`, `writing_interval`, `capture_time` and - after `vbe pair` -
+the transcript text spoken while that board was being written and explained.
 
 ## Safety
 
@@ -67,26 +66,26 @@ vbe boards gitignore\qft_lec_2026_05_18_00.mp4 --config configs\wis_qft_2026.yam
 ## Outputs (per video, under `output/<video_name>/`)
 
 ```
-timeline.json                       the LLM-ready index (see below)
-montage.png                         contact sheet of all snapshots
-boards/<column>/bBB_sSS_tHH-MM-SS.png        tight board crop (lecturer removed)
-boards/<column>/bBB_sSS_tHH-MM-SS_enh.png    CLAHE-enhanced legibility variant
-wall/tHH-MM-SS.png                  full-wall context frame
+timeline.json                          the LLM-ready index (see below)
+montage.png                            contact sheet of all board snapshots
+boards/<column>/<vert>_NN_tHH-MM-SS.png      single-board crop (lecturer removed)
+boards/<column>/<vert>_NN_tHH-MM-SS_enh.png  CLAHE-enhanced legibility variant
+wall/tHH-MM-SS.png                     full-wall context frame
 transcript.srt | .vtt | .txt | .json
 ```
 
-### timeline.json snapshot fields
+### timeline.json snapshot fields (each entry is ONE finished board)
 
 | field | meaning |
 |---|---|
-| `column` | which board column (`left` / `center` / `right`) |
-| `board` | board identity, e.g. `left#2` = the 2nd board on the left column (increments at each erase) |
-| `writing_interval` | `[a, b]` seconds: when this content was written (also `_str` as `HH:MM:SS`) |
-| `capture_time` | when the snapshot image was taken (just after writing stopped) |
-| `final` | `true` if this is the board's most complete state (no later snapshot before erase/end) |
-| `erased_at` | when this board was wiped (`null` = never within the analyzed range) |
-| `image` / `image_enhanced` / `wall_image` | the exported images |
-| `transcript` | `{start, end, text}` spoken from this burst's start until the next snapshot's burst (after `vbe pair`) |
+| `column` | which wall column the board is in (`left` / `center` / `right`) |
+| `vertical` | `upper` or `lower` board within that column at capture |
+| `location` | `<column>_<vertical>`, a human label |
+| `writing_interval` | `[a, b]` seconds: when this board was written (also `_str` as `HH:MM:SS`) |
+| `capture_time` | when the photo was taken (just after he finished and stepped away) |
+| `occlusion` | fraction of the board still hidden by the lecturer at capture |
+| `image` / `image_enhanced` / `wall_image` | the exported images; `image_size` = `[w, h]` |
+| `transcript` | `{start, end, text}` spoken while the board was written (after `vbe pair`) |
 
-Snapshots of the same `board` are progressive states of the same physical board filling up;
-the `final: true` one is the most complete. See `configs/default.yaml` for all tunables.
+The same board can appear more than once (filled further, or wiped and rewritten); each is a
+separate finished-board photo, in time order. See `configs/default.yaml` for all tunables.

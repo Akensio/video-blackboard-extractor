@@ -72,6 +72,82 @@ def trim_to_board(
     return bgr[y0:y1, x0:x1]
 
 
+def find_rail(col_gray: np.ndarray, margin: int = 35,
+              interior: tuple[float, float] = (0.18, 0.82)) -> int | None:
+    """Row (local to the crop) of the wooden rail splitting a column's two boards.
+
+    The rail is a horizontal wooden strip: bright across the FULL width, so its
+    per-row MEDIAN brightness stands well above the dark board baseline (chalk
+    is patchy and barely moves the median). Returns the strongest such interior
+    ridge, or None if no rail clears `margin` (one board fills the column, or it
+    is blank). Detected per-frame, so it tracks the boards as they slide.
+    """
+    med = np.median(col_gray, axis=1)
+    base = float(np.percentile(med, 30))
+    n = len(med)
+    lo, hi = int(interior[0] * n), int(interior[1] * n)
+    if hi <= lo:
+        return None
+    rel = med[lo:hi] - base
+    j = int(np.argmax(rel))
+    if rel[j] < margin:
+        return None
+    return lo + j
+
+
+def board_cell_extent(
+    col_gray: np.ndarray,
+    y_lo: float,
+    y_hi: float,
+    board_p25_threshold: int = 118,
+    bridge: int = 18,
+    pad: int = 8,
+) -> tuple[int, int]:
+    """Vertical extent of the single board panel that contains new writing.
+
+    Given a clean column crop and the row band [y_lo, y_hi] where fresh chalk
+    appeared, return the [top, bottom] of the dark board surface enclosing that
+    band - i.e. snap the writing to the wooden rails above and below it. This
+    isolates ONE board even when boards have slid, because it follows the dark
+    surface the chalk actually sits on rather than any fixed line. A row is
+    board-like when its 25th-percentile brightness is below the threshold
+    (wood/rails sit well above it); short bright interruptions are bridged.
+    """
+    n = col_gray.shape[0]
+    y_lo = max(0, min(n - 1, int(y_lo)))
+    y_hi = max(1, min(n, int(y_hi)))
+    p25 = np.percentile(col_gray, 25, axis=1)
+    boardlike = p25 < board_p25_threshold
+
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if not boardlike[i]:
+            i += 1
+            continue
+        j, gap, last = i, 0, i
+        while j < n:
+            if boardlike[j]:
+                last, gap = j, 0
+            else:
+                gap += 1
+                if gap > bridge:
+                    break
+            j += 1
+        runs.append((i, last + 1))
+        i = j
+
+    def overlap(r: tuple[int, int]) -> int:
+        return max(0, min(r[1], y_hi) - max(r[0], y_lo))
+
+    if not runs:
+        return max(0, y_lo - pad), min(n, y_hi + pad)
+    best = max(runs, key=overlap)
+    if overlap(best) <= 0:  # band fell in wood (shouldn't happen) - pad the band
+        return max(0, y_lo - pad), min(n, y_hi + pad)
+    return max(0, best[0] - pad), min(n, best[1] + pad)
+
+
 def enhance_board_crop(
     bgr: np.ndarray,
     clip_limit: float = 3.0,

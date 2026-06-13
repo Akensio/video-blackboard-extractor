@@ -82,58 +82,37 @@ def boards(
 
     result = pipeline.run_boards(video, cfg, out_dir, start=start, duration=duration, rebuild=rebuild)
 
-    boards_summary: dict[str, dict] = {}
-    for s in result.snapshots:
-        b = boards_summary.setdefault(s["board"], {
-            "column": s["column"], "snapshot_ids": [],
-            "first_writing_start": s["writing_interval"][0],
-            "erased_at": s["erased_at"], "final_snapshot_id": None,
-        })
-        b["snapshot_ids"].append(s["id"])
-        b["erased_at"] = b["erased_at"] or s["erased_at"]
-        if s["final"]:
-            b["final_snapshot_id"] = s["id"]
-
     from datetime import datetime, timezone
     write_timeline(out_dir, {
-        "schema_version": 2,
+        "schema_version": 4,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "video": result.video,
         "duration": result.duration,
         "analysis_range": [result.analysis_start, result.analysis_end],
-        "columns": result.columns,
-        "column_geometry": {r.name: r.bbox() for r in cfg.rois},
         "montage": result.montage,
         "transcript_file": None,  # filled by `vbe pair`
         "schema_notes": {
-            "snapshots": "Chronological board states. Snapshots sharing a `board` id "
-                         "are PROGRESSIVE states of the same physical board filling up; "
-                         "each later one contains the earlier content plus more. The "
-                         "`final: true` one is that board's most complete state.",
-            "writing_interval": "[start, end] in seconds from video start: when this "
-                                "content was chalked. The lecturer usually explains the "
-                                "material while writing it and just after.",
-            "visits": "Best-effort [start, end] stretches when the lecturer was detected "
-                      "at this column during the writing (informational; may be empty - "
-                      "his dark clothing defeats detection at times).",
-            "trigger": "What caused the capture: settled = writing stopped and the new "
-                       "content sat unchanged; pre_erase = the board was about to be "
-                       "wiped; flush = end-of-analysis safety net.",
-            "capture_time": "When the snapshot image was taken (seconds; just after "
-                            "writing stopped, lecturer out of frame or removed).",
-            "board": "<column>#<n>: the n-th board on that column; n increments when "
-                     "the column is erased (or its content slides out of view).",
-            "final_reason": "erased = wiped afterwards (see erased_at); "
-                            "end_of_analysis = still standing when analysis ended.",
-            "fullness": "Fraction of column pixels that are chalk strokes; a densely "
-                        "full board measures only ~0.15-0.25 - do NOT read as percent.",
-            "occlusion": "Fraction of the column hidden by the lecturer at capture.",
-            "images": "image = tight board crop (lecturer removed); image_enhanced = "
-                      "CLAHE+sharpened grayscale variant, most legible; wall_image = "
-                      "full 1920x1080 wall for spatial context. image_size = [w, h].",
+            "snapshots": "Each entry is ONE board the lecturer finished, in time order "
+                         "- like photographing a board once he's done with it and moved "
+                         "on. The same physical board can appear more than once if he "
+                         "fills it further or wipes and rewrites it; each is a separate "
+                         "finished-board photo.",
+            "writing_interval": "[start, end] seconds from video start: when this board's "
+                                "content was chalked. Play it to hear the explanation.",
+            "capture_time": "When the photo was taken (seconds; just after he finished "
+                            "and stepped away, lecturer removed from the image).",
+            "column": "Which wall column the board is in: left / center / right.",
+            "vertical": "upper or lower board within that column (from the crop's "
+                        "position at capture; boards slide, so this is per-photo).",
+            "location": "<column>_<vertical>, a human label for the board.",
+            "visits": "Best-effort [start, end] stretches the lecturer was at this "
+                      "column while writing (informational; may be empty).",
+            "occlusion": "Fraction of the board still hidden by the lecturer at capture.",
+            "images": "image = the single-board crop (lecturer removed); image_enhanced "
+                      "= CLAHE+sharpened grayscale, most legible; wall_image = full "
+                      "1920x1080 wall for context. image_size = [w, h].",
         },
         "snapshots": result.snapshots,
-        "boards": boards_summary,
     })
     typer.echo(f"[boards] {len(result.snapshots)} snapshots -> {out_dir / 'timeline.json'}")
     if result.montage:
