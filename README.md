@@ -9,9 +9,10 @@ periodically walks in front of the board.
 The output is designed as a ready-to-walk basis for LLM lecture-note generation:
 
 1. **Board snapshots** - mimics a student photographing a board once the lecturer finishes
-   it. The wall is watched as three columns; when a column gains real new chalk and then
-   stops changing for a while (he stepped away), the cleanest frame is captured, the
-   lecturer is removed, the column is split at its wooden rail, and **each board that got
+   it. The wall is watched as three columns; the lecturer's *visits* (sustained presence,
+   from a YOLO person mask - the projector screen is excluded) are tracked, and **when he
+   walks away from a board he just wrote on**, the cleanest now-unoccluded frame is captured,
+   the lecturer is removed, the column is split at its wooden rail, and **each board that got
    fresh writing is exported as its own single-board image** (+ a CLAHE-enhanced legibility
    variant), plus a full-wall context frame. The rail is found per-frame, so vertical
    sliding of the boards never matters. No erase/lifecycle bookkeeping: if a board is later

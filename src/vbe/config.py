@@ -68,10 +68,10 @@ class Config(BaseModel):
     # real writing. Raise only for halls where boards genuinely slide.
     change_slide_max_cells: int = 0
 
-    # --- lecturer presence (informational `visits` field only) ---
+    # --- lecturer presence (the snapshot trigger: he writes, then walks away) ---
     presence_threshold: float = 0.06     # board occlusion above this = he is at the board
-    presence_min_seconds: float = 4.0
-    presence_bridge_seconds: float = 8.0
+    presence_min_seconds: float = 5.0    # shorter than this is a walk-by, not a writing visit
+    presence_bridge_seconds: float = 12.0  # stay-away shorter than this is not "left" (look/grab chalk)
 
     # --- snapshot capture windows ---
     capture_post_seconds: float = 30.0       # search window after a trigger for the cleanest frame

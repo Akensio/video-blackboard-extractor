@@ -52,9 +52,9 @@ change_slide_max_cells: 0    # vertical slide compensation (pooled cells); 0 = o
 # Lecturer presence (informational `visits` field only; triggering does not
 # depend on it - his dark clothing makes position detection unreliable)
 # ---------------------------------------------------------------------------
-presence_threshold: 0.06
-presence_min_seconds: 4
-presence_bridge_seconds: 8
+presence_threshold: 0.06       # board occlusion above this = lecturer is at the board
+presence_min_seconds: 5        # shorter than this is a walk-by, not a writing visit
+presence_bridge_seconds: 12    # stay-away shorter than this is not "left" (look back / grab chalk)
 
 # ---------------------------------------------------------------------------
 # Snapshot capture windows

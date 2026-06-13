@@ -2,11 +2,12 @@
 
 Mimics a student photographing a board when the lecturer finishes it:
 
-  decode low-fps frames -> per-column chalk-hold state + occlusion signals
-  -> per column, detect "a board was finished" = real new chalk appeared and
-     then stopped changing for a while (he stepped away)
-  -> capture the cleanest frame, crop the SINGLE board the fresh chalk is on
-     (rail-to-rail, lecturer removed) -> board crop (+ enhanced) + wall context
+  decode low-fps frames -> per-column chalk-hold state + person/screen occlusion
+  -> per column, detect the lecturer's VISITS (sustained presence, YOLO-backed)
+     and capture when he WALKS AWAY from a board he just changed
+  -> capture the cleanest frame once he is gone, crop the SINGLE board the fresh
+     chalk is on (rail-to-rail, lecturer removed) -> board crop (+ enhanced) +
+     wall context
   -> timeline.json: chronological one-board-each snapshots with writing
      intervals. No erase/lifecycle bookkeeping; a wipe-and-rewrite just yields
      another finished board.
@@ -76,7 +77,8 @@ def _signals(cache: FrameCache, cfg: Config, columns, masks, bboxes, grid):
     n = cache.n
     names = [c.name for c in columns]
     raw = {nm: np.zeros(n) for nm in names}
-    occ = {nm: np.zeros(n) for nm in names}
+    occ = {nm: np.zeros(n) for nm in names}        # lecturer OR screen hides the board
+    person_occ = {nm: np.zeros(n) for nm in names}  # lecturer only -> presence/walk-away
     sharp = {nm: np.zeros(n) for nm in names}
 
     areas = {nm: int(masks[nm].sum()) for nm in names}
@@ -140,6 +142,7 @@ def _signals(cache: FrameCache, cfg: Config, columns, masks, bboxes, grid):
             if area == 0:
                 continue
             occ[nm][i] = 1.0 - int((m & visible).sum()) / area
+            person_occ[nm][i] = int((m & pmask).sum()) / area
             raw[nm][i] = np.count_nonzero(fullness_hold & m) / area
             x0, y0, x1, y1 = bboxes[nm]
             states[nm][i] = visits.max_pool((state_hold & m)[y0:y1, x0:x1], k,
@@ -155,22 +158,28 @@ def _signals(cache: FrameCache, cfg: Config, columns, masks, bboxes, grid):
     states = {nm: visits.debounce_states(states[nm], cfg.state_debounce_frames)
               for nm in names}
     smooth = {nm: fullness.smooth_signal(raw[nm], cfg.fullness_smooth_window) for nm in names}
-    return smooth, occ, sharp, states
+    return smooth, occ, person_occ, sharp, states
 
 
-def _column_timeline(nm, f, occ_sig, sharp_sig, states, cache, cfg, fps) -> list[_Snapshot]:
-    """Emit one snapshot per FINISHED board in this column.
+def _column_timeline(nm, f, occ_sig, person_occ_sig, sharp_sig, states, cache, cfg, fps) -> list[_Snapshot]:
+    """Emit one snapshot each time the lecturer FINISHES a board and walks away.
 
-    Mimics "take a picture when the professor finishes a board": when the
-    column's chalk state has gained real new writing since the last snapshot
-    and then stops changing for `stable_seconds` (he stepped away), capture it.
+    Mimics a student photographing a board once the professor is done with it:
+    he stands at a column writing (a "visit", detected from the YOLO-backed
+    occlusion signal), then leaves. When he leaves, if the board changed since
+    the last snapshot, capture the clean frame now that he is out of the way.
     The crop is later restricted to the single board the new chalk sits on, so
     sliding and the upper/lower boundary never matter here. No erase / lifecycle
     bookkeeping - a wipe-and-rewrite simply produces another finished board.
+
+    A "visit" ends only after he is away for `presence_bridge_seconds`, so a
+    brief step-back to look or grab chalk does not trigger a mid-writing capture.
     """
     n = len(f)
+    # Presence = the LECTURER only (person_occ), never the projector screen, so
+    # a screen lowered over the board is not mistaken for him standing there.
     presence_runs = visits.segment_visits(
-        occ_sig > cfg.presence_threshold, fps,
+        person_occ_sig > cfg.presence_threshold, fps,
         cfg.presence_min_seconds, cfg.presence_bridge_seconds,
     )
     scores = keyframe.score_frames(
@@ -178,7 +187,6 @@ def _column_timeline(nm, f, occ_sig, sharp_sig, states, cache, cfg, fps) -> list
         cfg.weight_fullness, cfg.weight_occlusion, cfg.weight_sharpness,
     )
     post = max(1, round(cfg.capture_post_seconds * fps))
-    stable_w = max(1, round(cfg.stable_seconds * fps))
 
     ref_state = states[0]
     ref_reset_i = 0
@@ -207,38 +215,34 @@ def _column_timeline(nm, f, occ_sig, sharp_sig, states, cache, cfg, fps) -> list
         ref_state = states[ci]
         ref_reset_i = ci
 
-    def has_new_writing(i: int) -> bool:
-        return int(added_mask(i).sum()) / states[i].size >= cfg.snapshot_change_min
+    def changed(ci: int) -> bool:
+        return int(added_mask(ci).sum()) / states[ci].size >= cfg.snapshot_change_min
 
-    i = stable_w
-    while i < n:
-        settled = (np.count_nonzero(states[i] ^ states[i - stable_w])
-                   / states[i].size) < cfg.stable_eps
-        if settled:
-            # Defer while the board is blocked (projector screen down, or the
-            # lecturer camped in front): capture at the next unblocked settle.
-            if occ_sig[i] > cfg.capture_max_occlusion:
-                i += 1
-                continue
-            if has_new_writing(i):
-                hi = min(i + post + 1, n)
-                ci = keyframe.select_best_index(scores, i, max(hi, i + 1))
-                emit(ci)
-                i = max(i + 1, ci + 1)
-                continue
-            # Big erase with nothing newly written: re-reference so the next
-            # board's writing window doesn't span the wipe.
-            _add, rem, valid = visits.compare_states(states[i], ref_state, 0)
+    # WALK-AWAY trigger: capture in the gap after each visit, once he is gone.
+    for idx, v in enumerate(presence_runs):
+        lo = v.end + 1
+        hi = min(v.end + post + 1, n)
+        nxt = presence_runs[idx + 1].start if idx + 1 < len(presence_runs) else n
+        hi = min(hi, nxt)  # never run into his next visit
+        if hi <= lo:
+            continue
+        ci = keyframe.select_best_index(scores, lo, hi)  # cleanest (low-occlusion) frame
+        if occ_sig[ci] > cfg.capture_max_occlusion:
+            continue  # board still blocked (projector screen / he lingers) - not photographable
+        if changed(ci):
+            emit(ci)
+        else:
+            # He left without adding content (erased, or just talked): keep the
+            # reference honest so a later rewrite still registers as new.
+            _a, rem, valid = visits.compare_states(states[ci], ref_state, 0)
             if int(rem.sum()) / max(1, int(valid.sum())) >= 4 * cfg.snapshot_change_min:
-                ref_state = states[i]
-                ref_reset_i = i
-        i += 1
+                ref_state, ref_reset_i = states[ci], ci
 
-    # End-of-analysis flush: a board left finished but never re-touched.
-    lo = max(ref_reset_i, n - 1 - post)
-    ci = keyframe.select_best_index(scores, lo, n)
-    if has_new_writing(n - 1):
-        emit(ci)
+    # End-of-analysis flush: he finished a board but never left before the clip
+    # ended (still standing there). Capture the cleanest available frame.
+    if changed(n - 1):
+        lo = max(ref_reset_i, n - 1 - post)
+        emit(keyframe.select_best_index(scores, lo, n))
     return snaps
 
 
@@ -289,13 +293,13 @@ def run_boards(
     half = max(1, round(cfg.median_window_seconds * fps))
     grid = background.build_plate_grid(cache, half_window_frames=half)
 
-    smooth, occ, sharp, states = _signals(cache, cfg, columns, masks, bboxes, grid)
+    smooth, occ, person_occ, sharp, states = _signals(cache, cfg, columns, masks, bboxes, grid)
 
     snaps: list[_Snapshot] = []
     for c in columns:
         nm = c.name
         snaps.extend(_column_timeline(
-            nm, smooth[nm], occ[nm], sharp[nm], states[nm], cache, cfg, fps))
+            nm, smooth[nm], occ[nm], person_occ[nm], sharp[nm], states[nm], cache, cfg, fps))
     snaps.sort(key=lambda s: s.capture_time)
 
     # --- full-resolution export ---
